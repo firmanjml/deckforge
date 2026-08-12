@@ -1,0 +1,6 @@
+{
+  "name": "deckforge-cockpit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeckForge Decky frontend (cockpit). Built via the root rollup config."
+}

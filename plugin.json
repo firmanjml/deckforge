@@ -1,0 +1,11 @@
+{
+  "name": "DeckForge",
+  "author": "DeckForge",
+  "flags": ["debug"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["trainer", "memory", "root"],
+    "description": "Native Decky trainer platform. Detects the running Steam game and exposes simple cheat toggles backed by a persistent Rust memory engine.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}

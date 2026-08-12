@@ -1,0 +1,683 @@
+DECKFORGE CE TABLE PORTING GUIDE FOR LLMS
+=========================================
+
+PURPOSE
+-------
+
+Use this file when converting a Cheat Engine .CT table into a DeckForge
+trainer package. A .CT file is XML source material. DeckForge does not load
+.CT files directly and does not launch Cheat Engine or a Windows trainer.
+
+The required output is usually:
+
+<trainer-root>/<steam-app-id>/
+  trainer.json
+  scripts/
+    one_or_more_auto_assembler_files.asm
+    optional_lua_resolvers.lua
+    optional_common_components.asm
+
+DeckForge targets offline/single-player play. Refuse requests to add anti-cheat
+bypass, evasion, concealment, kernel manipulation, or online cheating support.
+
+
+ARCHITECTURAL CONSTRAINTS
+-------------------------
+
+1. cockpit/ is presentation only. Never add game addresses or trainer logic.
+2. relay/ is JSON transport only. Never add memory, scanning, or trainer logic.
+3. forge/ is a game-agnostic engine. Do not add game-specific Rust code.
+4. All game-specific behavior belongs in the external trainer package.
+5. Prefer declarative JSON. Use Auto Assembler or Lua only when necessary.
+6. Do not create or invoke external Windows trainer executables.
+
+
+INPUTS TO REQUEST OR DERIVE
+---------------------------
+
+Collect these before producing a final port:
+
+- Complete .CT XML, not screenshots or a partial list of cheat names.
+- Steam AppID.
+- Game name.
+- Actual Proton game process/module name, including .exe and correct case.
+- Target architecture: x86 or x86-64.
+- Game build/version against which the table was tested.
+- Every user-visible CheatEntry and its enabled/disabled behavior.
+- Auto Assembler scripts, Lua scripts, pointer offsets, value types, and AOBs.
+- Shared symbols or parent entries required by child cheats.
+- License/author/source attribution that must remain with the port.
+
+If a required fact is missing, use an obvious placeholder such as
+REPLACE_WITH_PROCESS.exe or 0xREPLACE_ME and clearly report it. Never invent a
+working address, signature, expected byte sequence, process name, or AppID.
+
+
+OUTPUT CONTRACT
+---------------
+
+Return a complete package tree and the full content of every file. Do not emit
+ellipses inside code. Keep source attribution in trainer metadata or comments.
+
+Use:
+
+- formatVersion: 1
+- stable lowercase snake_case ids
+- forward-slash package-relative script paths
+- one trainer directory whose name equals game.steamAppId
+- valid JSON (no comments and no trailing commas)
+- hexadecimal offsets as quoted strings such as "0x1A20"
+- byte strings as uppercase space-separated pairs such as "48 8B ?? 20"
+
+Base trainer.json shape:
+
+{
+  "formatVersion": 1,
+  "game": {
+    "steamAppId": 123456,
+    "name": "Example Game",
+    "process": "ExampleGame.exe"
+  },
+  "trainer": {
+    "id": "example-game-default",
+    "name": "Example Game Trainer",
+    "version": "1.0.0",
+    "author": "Original author / port author"
+  },
+  "scripts": {
+    "setup": [],
+    "bootstrap": []
+  },
+  "cheats": []
+}
+
+Omit empty scripts/setup/bootstrap sections when unused.
+
+
+SUPPORTED CONTROLS AND VALUE TYPES
+----------------------------------
+
+Schema controls:
+
+- toggle
+- number
+- slider (accepted by schema but currently not rendered by Cockpit)
+- action
+- select (accepted by schema but currently not rendered by Cockpit)
+
+Prefer only toggle, number, and action in a currently usable package.
+
+Value types:
+
+- int8, int16, int32, int64
+- uint8, uint16, uint32, uint64
+- float32, float64
+
+Common CE mappings:
+
+- Byte -> int8 or uint8, selected from semantics
+- 2 Bytes -> int16 or uint16
+- 4 Bytes -> int32 or uint32
+- 8 Bytes -> int64 or uint64
+- Float -> float32
+- Double -> float64
+
+Do not guess signedness when negative values or the full unsigned range matter.
+
+
+DECISION TREE FOR EACH CHEAT ENTRY
+----------------------------------
+
+1. Does it only replace known bytes at one resolved address?
+   Use a patch action.
+
+2. Does the user type a number into a CE address/pointer record?
+   Use control number plus a value action.
+
+3. Is it a one-click write of a fixed typed value?
+   Use control action plus a value action with action.value.
+
+4. Is it a frozen typed address?
+   Use control toggle plus a freeze action.
+
+5. Does it contain aobscan + alloc + jump/code cave, multiple write sites, or
+   shared registered symbols?
+   Use control toggle plus an auto_assembler action and an .asm file.
+
+6. Does CE Lua discover a dynamic address using engine-specific structures,
+   string scans, RTTI, disassembly, or pointer searches?
+   Use a Lua script resolver. Put reusable functions in scripts.setup.
+
+7. Does one AA script install a pointer-capture hook used by many cheats?
+   Make it a scripts.bootstrap component and put its id in each dependent
+   cheat's requires array.
+
+8. Does the entry depend on CE forms, hotkeys, timers, process APIs,
+   filesystem/network APIs, native DLLs, or a full Lua onEnable/onDisable loop?
+   It cannot be copied directly. Redesign it with supported generic
+   primitives, or report it as unsupported.
+
+
+DECLARATIVE ACTION TEMPLATES
+----------------------------
+
+PATCH
+
+{
+  "id": "no_reload",
+  "name": "No Reload",
+  "control": "toggle",
+  "action": {
+    "type": "patch",
+    "resolver": {
+      "type": "signature",
+      "module": "ExampleGame.exe",
+      "pattern": "29 83 A0 00 00 00 48 8B ?? ??",
+      "offset": 0
+    },
+    "offset": 0,
+    "expected": "29 83 A0 00 00 00",
+    "enabled": "90 90 90 90 90 90"
+  }
+}
+
+Rules:
+
+- expected and enabled must contain the same number of bytes.
+- expected must be the original bytes at the exact write address.
+- enabled must cover complete instructions; do not split an instruction.
+- the resolver offset is applied to the AOB result first.
+- the patch action offset is added after the resolver result.
+- use only one offset layer unless both are intentionally required.
+- disable restoration is automatic from the bytes saved at enable time.
+- never remove expected-byte validation to make a broken port apply.
+
+NUMBER VALUE
+
+{
+  "id": "money",
+  "name": "Money",
+  "control": "number",
+  "min": 0,
+  "max": 999999999,
+  "action": {
+    "type": "value",
+    "valueType": "int32",
+    "resolver": {
+      "type": "pointer",
+      "module": "ExampleGame.exe",
+      "offset": "0x123456",
+      "offsets": ["0x20", "0x18", "0x8"]
+    }
+  }
+}
+
+ONE-SHOT VALUE BUTTON
+
+{
+  "id": "grant_money",
+  "name": "Grant Money",
+  "control": "action",
+  "action": {
+    "type": "value",
+    "valueType": "int32",
+    "value": 999999,
+    "resolver": {
+      "type": "module_offset",
+      "module": "ExampleGame.exe",
+      "offset": "0x123456"
+    }
+  }
+}
+
+FREEZE
+
+{
+  "id": "infinite_health",
+  "name": "Infinite Health",
+  "control": "toggle",
+  "action": {
+    "type": "freeze",
+    "valueType": "float32",
+    "value": 100.0,
+    "intervalMs": 100,
+    "resolver": {
+      "type": "pointer",
+      "module": "ExampleGame.exe",
+      "offset": "0x123456",
+      "offsets": ["0x20", "0x18"]
+    }
+  }
+}
+
+An action control may use a freeze action as a one-shot write. A number control
+cannot set a freeze action. A value action is stateless and cannot be toggled.
+
+
+RESOLVER TEMPLATES
+------------------
+
+Absolute (debug only; normally invalid after ASLR/relaunch):
+
+{"type":"absolute","address":"0x12345678"}
+
+Module offset:
+
+{"type":"module_offset","module":"ExampleGame.exe","offset":"0x18F020"}
+
+Pointer:
+
+{
+  "type":"pointer",
+  "module":"ExampleGame.exe",
+  "offset":"0x1AB0320",
+  "offsets":["0x30","0x18","0x20"]
+}
+
+Signature/AOB:
+
+{
+  "type":"signature",
+  "module":"ExampleGame.exe",
+  "pattern":"48 8B 05 ?? ?? ?? ?? 48 85 C0",
+  "offset":0
+}
+
+Lua script:
+
+{
+  "type":"script",
+  "language":"lua",
+  "file":"scripts/resolvers/money.lua"
+}
+
+Signature rules:
+
+- Wildcard only relocation bytes and genuinely variable operands.
+- Keep enough stable surrounding bytes for exactly one match.
+- AOBs must be unique. DeckForge errors on zero or multiple matches.
+- Prefer a module-scoped scan.
+- Test the pattern on the exact supported game build.
+- Do not silently select the first match.
+
+Pointer-chain rules:
+
+- Base is module base + resolver.offset.
+- The declarative pointer resolver currently reads a 64-bit pointer, adds the
+  next offset, and repeats; use it only for x86-64 targets.
+- For a 32-bit target, use a Lua resolver with trainer.read_pointer(), which
+  detects the target pointer width.
+- Every dereference must be valid.
+- Confirm the CE record's offset order instead of reversing it by intuition.
+
+
+AUTO ASSEMBLER ACTION
+---------------------
+
+trainer.json entry:
+
+{
+  "id": "infinite_ammo",
+  "name": "Infinite Ammo",
+  "control": "toggle",
+  "action": {
+    "type": "auto_assembler",
+    "file": "scripts/infinite_ammo.asm"
+  }
+}
+
+scripts/infinite_ammo.asm:
+
+[ENABLE]
+aobscanmodule(ammo,ExampleGame.exe,29 83 A0 00 00 00 48 8B)
+assert(ammo,29 83 A0 00 00 00)
+alloc(newmem,$1000,ammo)
+label(return)
+registersymbol(ammo)
+
+newmem:
+  // Cheat behavior goes here.
+  // Replay displaced instructions when the cheat does not replace them.
+  jmp return
+
+ammo:
+  jmp newmem
+  nop
+return:
+
+[DISABLE]
+ammo:
+  db 29 83 A0 00 00 00
+
+unregistersymbol(ammo)
+dealloc(newmem)
+
+Supported source features:
+
+- [ENABLE] and [DISABLE]
+- aobscan(name,pattern)
+- aobscanmodule(name,module,pattern)
+- aobscanregion(name,start,stop,pattern)
+- alloc(name,size[,near]) and dealloc(name)
+- label(name), name:, anonymous @@: with @f/@b
+- define(name,value)
+- registersymbol(name), unregistersymbol(name)
+- assert(address,bytes), including ?? wildcards
+- readmem(address,size)
+- align boundary[,fill]
+- db, dw, dd, dq
+- {$include relative/path.asm}
+- module-relative and symbol expressions with addition/subtraction
+- a common Intel-syntax x86/x64 set: data movement, integer ALU, shifts,
+  calls/jumps/conditional jumps, stack operations, scalar SSE, conditional
+  moves/setcc, and common x87 instructions
+
+Unsupported directives currently include:
+
+- createthread
+- loadlibrary
+- globalalloc
+- fullaccess
+- aobscanunique
+- loadedsymbol
+- deallocf
+- allocnx
+- registerexe / unregisterexe
+- CE include(...) (use {$include ...})
+
+Unknown directives and instructions are hard errors. Never delete an unknown
+line merely to make the parser accept the file; determine its behavior and
+rewrite it with supported primitives or report the limitation.
+
+Numeric/expression notes:
+
+- Address-context bare numbers follow CE and are hexadecimal.
+- Size/count-context bare numbers are decimal.
+- 0x100 and $100 explicitly mean hexadecimal.
+- #100 explicitly means decimal.
+- Expressions support symbol/module plus and minus chains.
+- Prefer explicit prefixes when a value could be misunderstood.
+
+Data examples:
+
+db 90 90 90
+dw 1234
+dd (float)100.0
+dq (double)1.5
+dq playerPtr
+
+Porting invariants:
+
+- Determine the exact number of complete instructions overwritten by a hook.
+- A near jmp is 5 bytes. Add nops only for remaining whole overwritten bytes.
+- Replay all displaced instructions unless changing them is the cheat.
+- Keep stack pointer and push/pop pairs balanced on every path.
+- Preserve registers and flags that the original code expects.
+- Do not transplant x64 register code into a 32-bit target or vice versa.
+- Allocate near the hook when relative branches or RIP-relative symbols need it.
+- Restore exact original bytes in [DISABLE].
+- Unregister owned symbols and deallocate owned allocations on disable.
+- Each aobscan variant requires exactly one result.
+- [ENABLE] is transactional, but [DISABLE] must still be correct and complete.
+
+Use readmem when a CE script captures original bytes dynamically:
+
+[ENABLE]
+aobscanmodule(INJECT,ExampleGame.exe,8B 83 ?? ?? ?? ?? 85 C0)
+alloc(newmem,$1000,INJECT)
+label(original)
+label(return)
+
+newmem:
+original:
+  readmem(INJECT,6)
+  jmp return
+
+INJECT:
+  jmp newmem
+  nop
+return:
+registersymbol(INJECT)
+registersymbol(original)
+
+[DISABLE]
+INJECT:
+  readmem(original,6)
+unregistersymbol(original)
+unregistersymbol(INJECT)
+dealloc(newmem)
+
+
+SHARED COMPONENTS AND SYMBOLS
+-----------------------------
+
+Use scripts.bootstrap for a shared runtime hook such as a player-pointer
+capture. Do not duplicate the same hook in every cheat.
+
+trainer.json:
+
+"scripts": {
+  "bootstrap": [
+    {"id":"player_pointer","file":"scripts/common/player_pointer.asm"}
+  ]
+}
+
+Dependent cheat:
+
+{
+  "id": "health",
+  "name": "Health",
+  "control": "number",
+  "requires": ["player_pointer"],
+  "action": {
+    "type": "value",
+    "valueType": "float32",
+    "resolver": {
+      "type": "script",
+      "language": "lua",
+      "file": "scripts/resolvers/health.lua"
+    }
+  }
+}
+
+Bootstrap requirements:
+
+- Component ids are unique.
+- Every requires id must be declared.
+- The component .asm contains [ENABLE] and [DISABLE].
+- Register symbols that dependent Lua resolvers need.
+- Components are initialized lazily and reference-counted.
+- A symbol/allocation has owner claims; one script must not destroy another
+  owner's still-live resource.
+
+Do not confuse these two mechanisms:
+
+- {$include helpers.asm} is source inclusion.
+- "requires": ["player_pointer"] is runtime lifecycle dependency.
+
+
+LUA SCRIPT RESOLVERS
+--------------------
+
+Lua chunks must return a non-negative integer address.
+
+Example scripts/resolvers/health.lua:
+
+local holder = trainer.symbol("playerPtr")
+if holder == nil then
+  error("player_pointer bootstrap is not active")
+end
+
+local player = trainer.read_pointer(holder)
+if player == 0 then
+  error("player pointer is null")
+end
+
+return player + 0x1C
+
+Lua resolver declarations must use exactly one of code or file. language is
+optional, but if present it must be lua.
+
+Shared helper files:
+
+"scripts": {
+  "setup": [
+    "scripts/common/gamemaker.lua",
+    "scripts/common/game_helpers.lua"
+  ]
+}
+
+They execute in order once when the shared VM boots. The VM persists across
+resolves and resets on trainer reload or process exit. Cache discovery in Lua
+globals only when it remains valid for that attached process.
+
+Available trainer API:
+
+- read_i8/i16/i32/i64, read_u8/u16/u32/u64, read_f32/f64
+- write_i8/i16/i32/i64, write_u8/u16/u32/u64, write_f32/f64
+- read_bytes(addr,len), write_bytes(addr,{bytes})
+- read_block(addr,len), read_string(addr[,max])
+- read_pointer(addr), pointer_size(), is64()
+- find_module(name), regions(), region_of(addr)
+- scan_signature(module,pattern[,offset])
+- scan_signature_all(module,pattern)
+- scan_string(bytes[,module])
+- scan_pointers_to(addr[,module[,writable]])
+- resolve_pointer(module,offset,{offsets})
+- disasm_targets(addr[,size])
+- rtti_class_name(addr)
+- symbol(name), module(), pid(), sleep(ms), log(...)
+
+Sandbox restrictions:
+
+- No os, io, package, require, debug, load, loadstring, or dofile.
+- No filesystem, network, shell, process, or native-library access.
+- print and trainer.log go to Forge stderr, never stdout.
+- Failed memory calls raise structured Lua/engine errors.
+- There is no full Lua cheat action with on_enable/on_disable/on_tick hooks.
+  Lua is for setup libraries and address resolvers.
+
+
+CE XML INTERPRETATION NOTES
+---------------------------
+
+When reading CheatEntry XML:
+
+- Description -> cheat.name, removing CE quote encoding.
+- ID is not a good public id. Derive a stable snake_case id from the name.
+- VariableType -> valueType mapping above.
+- Address plus Offsets -> module_offset or pointer resolver.
+- A leading executable+offset is relative to the module, not absolute.
+- Active=1 is author/session state; do not ship cheats enabled by default.
+- Group Header entries are organization only; DeckForge has no group schema.
+- Hotkeys do not become controls automatically; choose toggle/number/action.
+- Color, LastState, ShowAsHex, Display entries are CE UI metadata and normally
+  do not belong in trainer.json.
+- AssemblerScript -> external .asm file unless it simplifies to patch.
+- CE LuaScript -> analyze its purpose; do not assume CE's Lua API exists.
+- Child entries that reference a parent symbol need a bootstrap dependency or
+  should be merged into the same Auto Assembler action.
+
+Do not preserve nested CE entries mechanically if that produces hidden ordering
+requirements. Make dependencies explicit with scripts.bootstrap and requires.
+
+
+VALIDATION CHECKLIST
+--------------------
+
+Static package checks:
+
+[ ] Directory name equals game.steamAppId.
+[ ] formatVersion is 1.
+[ ] game.process is the real Proton game executable.
+[ ] trainer.id and every cheat.id are unique and stable.
+[ ] JSON parses without comments or trailing commas.
+[ ] Script paths are relative, use /, exist, and do not contain .. or drives.
+[ ] Every requires id exists in scripts.bootstrap.
+[ ] auto_assembler actions use control toggle.
+[ ] Patch expected/enabled lengths match and cover whole instructions.
+[ ] Number controls use value actions.
+[ ] Action/value entries declare action.value.
+[ ] Lua resolvers use exactly one of code or file and return an integer address.
+[ ] Unsupported AA directives/instructions have been redesigned or reported.
+[ ] Source attribution and licensing are preserved.
+
+Runtime checks on SteamOS/Proton:
+
+[ ] Forge detects and attaches to the intended process.
+[ ] Every signature has one match on the supported build.
+[ ] Every pointer dereference and Lua-resolved address is valid.
+[ ] Each cheat enables successfully.
+[ ] Each cheat disables and restores original behavior/bytes.
+[ ] Repeated enable/disable cycles work.
+[ ] Cheats work together without symbol or hook conflicts.
+[ ] Save/load, level transition, death/respawn, and game restart are tested.
+[ ] Freeze resolvers follow changing player/object addresses.
+[ ] Reloading the trainer safely tears down active scripts/components.
+[ ] Exiting the game stops all writes.
+
+Run repository checks:
+
+cargo test --manifest-path forge/Cargo.toml
+cargo build --manifest-path forge/Cargo.toml
+python scripts/test_ipc.py
+
+Real memory behavior must be tested on Linux/SteamOS with the target game.
+
+
+ERROR-DRIVEN REPAIR
+-------------------
+
+SIGNATURE_NOT_FOUND:
+- Verify module name, build, scan scope, and byte pattern.
+- Confirm Proton module span and the bytes at the intended instruction.
+- Do not replace it with a guessed static address.
+
+SIGNATURE_AMBIGUOUS:
+- Add stable surrounding bytes or use a narrower region.
+- Do not select the first match.
+
+EXPECTED_BYTES_MISMATCH:
+- Re-check the resolved target and both offset layers.
+- Re-check the supported game build.
+- Do not weaken or remove expected bytes.
+
+INVALID_POINTER or MEMORY_READ_FAILED:
+- Verify pointer width and offset order. The declarative pointer resolver is
+  currently 64-bit; use Lua trainer.read_pointer() for 32-bit targets.
+- Check whether the object exists only after a level/save has loaded.
+- Consider a pointer-capture bootstrap or Lua resolver.
+
+MEMORY_WRITE_FAILED:
+- Confirm attach privileges, mapped region, address, and value width.
+- Do not add anti-cheat bypass or privilege-evasion logic.
+
+AUTO_ASSEMBLER_ERROR:
+- Use the reported file, section, line, command, and cause.
+- Rewrite unsupported directives/instructions explicitly.
+- Check unknown symbols, allocation proximity, branch range, and restore code.
+
+SCRIPT_ERROR:
+- Make nil/null cases explicit.
+- Verify every trainer API call and returned type.
+- Ensure required bootstrap symbols are registered before lookup.
+
+
+REQUIRED FINAL REPORT FROM AN LLM
+---------------------------------
+
+After producing a package, summarize:
+
+1. Files created.
+2. CE entries converted and their DeckForge action/resolver types.
+3. Shared components and dependency graph.
+4. Unsupported or omitted CE features with exact reasons.
+5. Assumptions and placeholders that require human confirmation.
+6. Game/build-specific signatures, offsets, or original bytes to verify.
+7. Static tests performed and their results.
+8. On-device runtime tests still required.
+
+Never claim that a trainer works unless it has been tested against the target
+game build on Linux/SteamOS. Compilation and JSON validation alone are not
+proof that memory addresses, signatures, hooks, or calling assumptions are
+correct.

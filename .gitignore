@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+
+# Forge build artifacts
+forge/target/
+bin/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.log
+
+# Local environment overrides
+.env
+
+# Local agent instructions
+AGENTS.md
+agents.md
+
+fixtures
+*_out.txt
+scripts
