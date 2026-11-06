@@ -123,6 +123,29 @@ fn path_matches(path: &str, module: &str) -> bool {
     basename.eq_ignore_ascii_case(module) || path.eq_ignore_ascii_case(module)
 }
 
+/// Does a maps path name a file on disk that could be a loaded module?
+/// Excludes kernel pseudo-paths (`[heap]`, `[stack]`, `[vdso]`) and device or
+/// shared-memory mappings, which are not stable bases for an address.
+pub fn is_module_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("/dev/")
+        && !path.starts_with("/memfd:")
+        && !path.starts_with("/SYSV")
+}
+
+/// Can this region hold game data worth scanning? Covers anonymous memory
+/// (where Proton maps most PE sections), the native heap, and the writable
+/// data of loaded modules. Stacks and device mappings (GPU memory) are skipped.
+pub fn is_scannable(region: &MemoryRegion) -> bool {
+    if !region.readable || !region.writable {
+        return false;
+    }
+    match region.path.as_deref() {
+        None => true,
+        Some(p) => p == "[heap]" || p.starts_with("[anon") || is_module_path(p),
+    }
+}
+
 /// All regions belonging to a module.
 pub fn module_regions<'a>(regions: &'a [MemoryRegion], module: &str) -> Vec<&'a MemoryRegion> {
     regions
@@ -241,6 +264,29 @@ mod tests {
         assert_eq!(readable_regions(&regions).len(), 5); // all but the '-' perms line
         assert_eq!(writable_regions(&regions).len(), 3);
         assert_eq!(executable_regions(&regions).len(), 2);
+    }
+
+    #[test]
+    fn module_paths_exclude_pseudo_and_device_paths() {
+        assert!(is_module_path("/opt/game/Game.exe"));
+        assert!(!is_module_path("[heap]"));
+        assert!(!is_module_path("[stack]"));
+        assert!(!is_module_path("/dev/dri/renderD128"));
+        assert!(!is_module_path("/memfd:wine (deleted)"));
+    }
+
+    #[test]
+    fn scannable_regions_cover_game_data_only() {
+        let region = |perms: &str, path: &str| {
+            parse_maps(&format!("1000-2000 {perms} 00000000 00:00 0 {path}\n")).remove(0)
+        };
+        assert!(is_scannable(&region("rw-p", "")));
+        assert!(is_scannable(&region("rw-p", "[heap]")));
+        assert!(is_scannable(&region("rw-p", "[anon:wine]")));
+        assert!(is_scannable(&region("rw-p", "/opt/game/Game.exe")));
+        assert!(!is_scannable(&region("r--p", "/opt/game/Game.exe")));
+        assert!(!is_scannable(&region("rw-p", "[stack]")));
+        assert!(!is_scannable(&region("rw-s", "/dev/dri/renderD128")));
     }
 
     #[test]

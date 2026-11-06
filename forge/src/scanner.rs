@@ -6,7 +6,14 @@
 //! integer of the requested width.
 
 use crate::error::{EngineError, EngineResult};
+use crate::memory::regions::is_scannable;
 use crate::memory::{MemoryAccess, MemoryRegion};
+
+/// Largest single region a scan reads. Regions are read in chunks, so this only
+/// guards against scanning huge reservations the game never touches.
+const MAX_SCAN_REGION: usize = 1024 * 1024 * 1024;
+/// Cap on stored matches, which keeps a very common value from exhausting memory.
+const MAX_RESULTS: usize = 10_000_000;
 
 /// Holds the state of a value scan session: the set of addresses that matched
 /// the last scan, ready to be filtered by the next value.
@@ -43,12 +50,16 @@ pub fn first_scan(
     };
     let mut found = Vec::new();
 
-    for region in maps.iter().filter(|r| r.readable && r.writable) {
+    for region in maps.iter().filter(|r| is_scannable(r)) {
         let size = region.size();
-        // Skip empty, very large, or file-backed regions. GameMaker stores
-        // values in heap/anonymous memory; file-backed regions (like the exe
-        // and shared libs) are huge and slow to scan.
-        if size == 0 || size > 64 * 1024 * 1024 || region.path.is_some() {
+        if size == 0 {
+            continue;
+        }
+        if size > MAX_SCAN_REGION {
+            eprintln!(
+                "[forge] scan: skipping {size}-byte region at 0x{:x}",
+                region.start
+            );
             continue;
         }
         // Read in 1MB chunks to avoid blocking on huge regions and to make
@@ -61,6 +72,11 @@ pub fn first_scan(
             match mem.read_bytes(addr, chunk_size) {
                 Ok(data) => {
                     scan_region(&data, addr, &needle, &mut found);
+                    if found.len() > MAX_RESULTS {
+                        return Err(EngineError::InvalidRequest(format!(
+                            "more than {MAX_RESULTS} matches; scan for a less common value"
+                        )));
+                    }
                 }
                 Err(_) => {
                     // Skip unreadable chunks (unmapped pages, etc.)
@@ -159,4 +175,32 @@ fn encode_float(value: f64, width: usize) -> EngineResult<Vec<u8>> {
             )))
         }
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod live_tests {
+    use super::*;
+    use crate::memory::regions::parse_maps;
+    use crate::process::procfs::read_maps_raw;
+
+    /// Reads this test process's own memory, which needs no extra privileges.
+    fn own_process() -> (MemoryAccess, Vec<MemoryRegion>) {
+        let pid = std::process::id() as i32;
+        let maps = parse_maps(&read_maps_raw(pid).expect("read maps"));
+        (MemoryAccess::new(pid), maps)
+    }
+
+    #[test]
+    fn first_scan_finds_value_in_region_over_64_mib() {
+        const VALUE: i64 = 0x0012_3456_789A_BCDE;
+        const OFFSET: usize = 70 * 1024 * 1024;
+        let mut buf = vec![0u8; 80 * 1024 * 1024];
+        buf[OFFSET..OFFSET + 8].copy_from_slice(&VALUE.to_ne_bytes());
+        std::hint::black_box(&mut buf);
+        let addr = buf.as_ptr() as usize + OFFSET;
+
+        let (mem, maps) = own_process();
+        let found = first_scan(&mem, &maps, VALUE as f64, 8, false).expect("scan");
+        assert!(found.contains(&addr));
+    }
 }
