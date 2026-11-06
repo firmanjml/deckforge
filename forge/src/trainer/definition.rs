@@ -142,9 +142,12 @@ impl CheatDefinition {
         let below = self.min.is_some_and(|min| number < min);
         let above = self.max.is_some_and(|max| number > max);
         if below || above {
+            let bound = |limit: Option<f64>| limit.map_or("any".to_string(), |v| v.to_string());
             return Err(EngineError::InvalidRequest(format!(
-                "{number} is outside the allowed range for '{}' (min {:?}, max {:?})",
-                self.name, self.min, self.max
+                "{number} is outside the allowed range for '{}' (min {}, max {})",
+                self.name,
+                bound(self.min),
+                bound(self.max)
             )));
         }
         Ok(())
