@@ -82,6 +82,7 @@ impl EngineState {
     pub fn detach(&mut self) {
         self.process = None;
         self.maps = None;
+        self.scan.clear();
         if let Some(t) = &mut self.trainer {
             t.reset_runtime_state();
         }
@@ -92,6 +93,8 @@ impl EngineState {
     pub fn attach_game(&mut self, app_id: u64) -> EngineResult<GameData> {
         let gp = process::find_game_process(app_id)?;
         let pid = gp.pid;
+        // Scan results are addresses in the previously attached process.
+        self.scan.clear();
         self.process = Some(gp);
         // Maps may fail to read for some processes; degrade gracefully.
         let maps = process::modules::read_modules(pid).unwrap_or_default();
