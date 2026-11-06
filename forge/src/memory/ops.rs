@@ -20,8 +20,8 @@ pub const MAX_AOB_RESULTS: usize = 4096;
 /// Largest single region an AOB scan will read. Regions are read in chunks, so
 /// this does not guard our memory. A larger region cannot be fully backed on a
 /// 16 GiB Deck, so it is mostly untouched reservation, and reading that costs
-/// seconds of engine time and grows the target's page tables (measured on a
-/// desktop: 5 GiB/s and 2 MiB of page tables per GiB).
+/// seconds of engine time and grows the target's page tables (measured in a dev
+/// container, not on a Deck: 5 GiB/s and 2 MiB of page tables per GiB).
 const MAX_SCAN_REGION: usize = 16 * 1024 * 1024 * 1024;
 /// Scan chunk size.
 pub(crate) const SCAN_CHUNK: usize = 4 * 1024 * 1024;
