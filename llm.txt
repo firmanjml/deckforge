@@ -620,7 +620,6 @@ Run repository checks:
 
 cargo test --manifest-path forge/Cargo.toml
 cargo build --manifest-path forge/Cargo.toml
-python scripts/test_ipc.py
 
 Real memory behavior must be tested on Linux/SteamOS with the target game.
 
