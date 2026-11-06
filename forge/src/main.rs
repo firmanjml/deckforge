@@ -154,8 +154,13 @@ fn dispatch(state: &mut EngineState, cmd: &Command) -> EngineResult<serde_json::
 
         Command::GetTrainer { app_id } => {
             if let Some(app) = app_id {
-                let current = state.process.as_ref().map(|p| p.app_id) == Some(*app);
-                if !current && state.trainer.is_none() {
+                let attached = state.process.as_ref().map(|p| p.app_id);
+                // Loading another game's trainer would shut down the running one.
+                if attached.is_some_and(|running| running != *app) {
+                    return Ok(serde_json::Value::Null);
+                }
+                let loaded = state.trainer.as_ref().map(|t| t.def.game.steam_app_id);
+                if loaded != Some(*app) {
                     state.load_trainer_for(*app)?;
                 }
             }
