@@ -7,6 +7,8 @@
 
 use std::collections::HashSet;
 
+use memchr::memmem::Finder;
+
 use crate::error::{EngineError, EngineResult};
 use crate::memory::regions::is_module_path;
 use crate::memory::{find_module, module_base, MemoryAccess, MemoryRegion, ModuleInfo};
@@ -187,12 +189,13 @@ pub(crate) fn find_bytes(
     if needle.is_empty() {
         return;
     }
+    let finder = Finder::new(needle);
     for (addr, len) in scan_chunks(start, end, needle.len() - 1) {
         let Ok(data) = mem.read_bytes(addr, len) else {
             continue;
         };
-        for (i, window) in data.windows(needle.len()).enumerate() {
-            if (addr + i) % align == 0 && window == needle {
+        for i in occurrences(&data, &finder) {
+            if (addr + i) % align == 0 {
                 hits.push(addr + i);
                 if hits.len() >= max {
                     return;
@@ -200,6 +203,17 @@ pub(crate) fn find_bytes(
             }
         }
     }
+}
+
+/// Start offsets of every occurrence in `data`, overlapping ones included.
+/// `memmem::find_iter` would skip those, and they can be the aligned hits.
+fn occurrences<'a>(data: &'a [u8], finder: &'a Finder) -> impl Iterator<Item = usize> + 'a {
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        let found = pos + finder.find(&data[pos..])?;
+        pos = found + 1;
+        Some(found)
+    })
 }
 
 impl<'a> MemoryOps for LiveMemory<'a> {
@@ -421,6 +435,30 @@ mod scan_tests {
     fn empty_ranges_read_nothing() {
         assert_eq!(scan_chunks(START, START, 7).count(), 0);
         assert_eq!(scan_chunks(START + 1, START, 7).count(), 0);
+    }
+
+    #[test]
+    fn occurrences_agree_with_a_sliding_window() {
+        let data = b"aaaabaaabaaaaa\x00\x00\x00\x00ab";
+        let needles: [&[u8]; 7] = [b"a", b"aa", b"aaa", b"aab", b"ab", b"\x00\x00", b"missing"];
+        for needle in needles {
+            let expected: Vec<usize> = data
+                .windows(needle.len())
+                .enumerate()
+                .filter(|(_, w)| *w == needle)
+                .map(|(i, _)| i)
+                .collect();
+            let finder = Finder::new(needle);
+            let found: Vec<usize> = occurrences(data, &finder).collect();
+            assert_eq!(found, expected, "{needle:?}");
+        }
+    }
+
+    #[test]
+    fn occurrences_handle_a_needle_longer_than_the_data() {
+        let finder = Finder::new(b"abc");
+        assert_eq!(occurrences(b"ab", &finder).count(), 0);
+        assert_eq!(occurrences(b"", &finder).count(), 0);
     }
 
     fn region(start: usize, end: usize) -> MemoryRegion {

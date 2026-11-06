@@ -17,6 +17,9 @@ serde_json = "1"
 # from / written to the *target* process (any OS).
 iced-x86 = { version = "1", default-features = false, features = ["decoder", "std", "code_asm"] }
 
+# SIMD byte and substring search for AOB and byte scans. Pure Rust.
+memchr = "2"
+
 # Embedded Lua 5.4 for scripted cheats (trainer packages ship .lua files).
 # `vendored` builds Lua from source so no system Lua is required (important
 # for SteamOS cross-builds); `send` lets script VMs live on the central

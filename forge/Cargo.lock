@@ -52,6 +52,7 @@ version = "0.1.0"
 dependencies = [
  "iced-x86",
  "libc",
+ "memchr",
  "mlua",
  "serde",
  "serde_json",

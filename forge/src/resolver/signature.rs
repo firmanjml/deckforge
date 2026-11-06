@@ -38,28 +38,53 @@ pub fn parse_pattern(s: &str) -> EngineResult<Vec<PatternByte>> {
     Ok(out)
 }
 
-/// All match start offsets of `pattern` within `haystack`.
+/// How common `byte` is in x86-64 game images, from 0 (rare) upward. The tiers
+/// come from byte counts over PE and ELF binaries: `00` is 13-18% of all bytes,
+/// the last tier about 1%, and the bytes left out 0.5% or less.
+fn commonness(byte: u8) -> u8 {
+    match byte {
+        0x00 => 5,
+        0x48 | 0xFF => 4,
+        0x0F | 0x24 | 0x89 | 0x8B => 3,
+        0x01 | 0x41 | 0x4C | 0x8D => 2,
+        0x08 | 0x10 | 0x20 | 0x44 | 0x45 | 0x49 | 0x74 | 0x75 | 0x83 | 0x84 | 0x85 | 0xC0
+        | 0xCC | 0xE8 | 0xE9 => 1,
+        _ => 0,
+    }
+}
+
+/// All match start offsets of `pattern` within `haystack`, including overlapping
+/// ones. Only positions holding the pattern's rarest exact byte are compared, and
+/// `memchr` finds those. An all-wildcard pattern matches at every offset.
 pub fn all_matches(haystack: &[u8], pattern: &[PatternByte]) -> Vec<usize> {
     let plen = pattern.len();
     if plen == 0 || plen > haystack.len() {
         return Vec::new();
     }
-    let mut matches = Vec::new();
-    for (i, window) in haystack.windows(plen).enumerate() {
-        let mut ok = true;
-        for (b, p) in window.iter().zip(pattern) {
-            if let PatternByte::Exact(e) = p {
-                if b != e {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            matches.push(i);
-        }
-    }
-    matches
+    let last_start = haystack.len() - plen;
+    let anchor = pattern
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| match p {
+            PatternByte::Exact(b) => Some((i, *b)),
+            PatternByte::Wildcard => None,
+        })
+        .min_by_key(|(_, b)| commonness(*b));
+    let Some((anchor_at, anchor_byte)) = anchor else {
+        return (0..=last_start).collect();
+    };
+    // Searching from `anchor_at` makes each hit's offset the match start.
+    memchr::memchr_iter(anchor_byte, &haystack[anchor_at..=last_start + anchor_at])
+        .filter(|&start| {
+            haystack[start..start + plen]
+                .iter()
+                .zip(pattern)
+                .all(|(b, p)| match p {
+                    PatternByte::Exact(e) => b == e,
+                    PatternByte::Wildcard => true,
+                })
+        })
+        .collect()
 }
 
 /// Classified result of a scan.
@@ -203,6 +228,132 @@ mod tests {
         let p = parse_pattern("48 ?? 8B").unwrap();
         let hay = [0x48, 0x00, 0x8B, 0x48, 0x11, 0x8B, 0x48, 0x22, 0x99];
         assert_eq!(all_matches(&hay, &p), vec![0, 3]);
+    }
+
+    /// The original byte-by-byte matcher, kept as the reference.
+    fn naive_matches(haystack: &[u8], pattern: &[PatternByte]) -> Vec<usize> {
+        if pattern.is_empty() || pattern.len() > haystack.len() {
+            return Vec::new();
+        }
+        haystack
+            .windows(pattern.len())
+            .enumerate()
+            .filter(|(_, window)| {
+                window.iter().zip(pattern).all(|(b, p)| match p {
+                    PatternByte::Exact(e) => b == e,
+                    PatternByte::Wildcard => true,
+                })
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// A deterministic xorshift generator, so failures reproduce.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn bytes(&mut self, len: usize, alphabet: &[u8]) -> Vec<u8> {
+            (0..len).map(|_| alphabet[self.below(alphabet.len())]).collect()
+        }
+    }
+
+    #[test]
+    fn all_matches_agrees_with_the_naive_matcher() {
+        const COMMON: &[u8] = &[0x00, 0x48, 0x8B, 0xFF, 0x89, 0x0F];
+        let every_byte: Vec<u8> = (0..=255).collect();
+        let alphabets: [&[u8]; 5] = [&[0x00], &[0x00, 0x01], &[0xAB, 0xCD], COMMON, &every_byte];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+
+        for round in 0..4000 {
+            let alphabet = alphabets[round % alphabets.len()];
+            let len = rng_len(&mut rng);
+            let hay = rng.bytes(len, alphabet);
+
+            // Half the patterns are cut from the data, so they do match.
+            let plen = 1 + rng.below(12);
+            let source = if round % 2 == 0 && plen <= hay.len() {
+                let at = rng.below(hay.len() - plen + 1);
+                hay[at..at + plen].to_vec()
+            } else {
+                rng.bytes(plen, alphabet)
+            };
+            // Wildcard density from none through to all of the pattern.
+            let density = rng.below(5);
+            let pattern: Vec<PatternByte> = source
+                .into_iter()
+                .map(|b| {
+                    if rng.below(4) < density {
+                        PatternByte::Wildcard
+                    } else {
+                        PatternByte::Exact(b)
+                    }
+                })
+                .collect();
+
+            assert_eq!(
+                all_matches(&hay, &pattern),
+                naive_matches(&hay, &pattern),
+                "pattern {pattern:?} over {hay:02X?}"
+            );
+        }
+    }
+
+    fn rng_len(rng: &mut Rng) -> usize {
+        match rng.below(3) {
+            0 => rng.below(16),
+            1 => rng.below(256),
+            _ => rng.below(4096),
+        }
+    }
+
+    #[test]
+    fn all_matches_handles_wildcards_at_the_edges() {
+        let hay = [0x10, 0x20, 0x30, 0x10, 0x20, 0x30, 0x10];
+        for (text, expected) in [
+            ("?? 20", vec![0, 3]),
+            ("?? ?? 30", vec![0, 3]),
+            ("10 ??", vec![0, 3]),
+            ("10 ?? ??", vec![0, 3]),
+            ("?? 20 ??", vec![0, 3]),
+            ("?? ?? ?? 10", vec![0, 3]),
+            ("30 ?? ?? 30", vec![2]),
+        ] {
+            let p = parse_pattern(text).unwrap();
+            assert_eq!(all_matches(&hay, &p), expected, "{text}");
+            assert_eq!(all_matches(&hay, &p), naive_matches(&hay, &p), "{text}");
+        }
+    }
+
+    #[test]
+    fn all_wildcard_pattern_matches_at_every_offset() {
+        let p = parse_pattern("?? ?? ??").unwrap();
+        assert_eq!(all_matches(&[1, 2, 3, 4, 5], &p), vec![0, 1, 2]);
+        assert_eq!(all_matches(&[1, 2, 3], &p), vec![0]);
+        assert!(all_matches(&[1, 2], &p).is_empty());
+    }
+
+    #[test]
+    fn all_matches_finds_overlapping_occurrences() {
+        let p = parse_pattern("AA AA").unwrap();
+        assert_eq!(all_matches(&[0xAA; 4], &p), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn all_matches_accepts_a_pattern_as_long_as_the_haystack() {
+        let p = parse_pattern("?? BB").unwrap();
+        assert_eq!(all_matches(&[0xAA, 0xBB], &p), vec![0]);
+        assert!(all_matches(&[0xAA, 0xCC], &p).is_empty());
     }
 }
 
