@@ -911,7 +911,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../fixtures/trainers/1669420/scripts/common/gamemaker.lua"
         );
-        let src = std::fs::read_to_string(path).expect("gamemaker.lua fixture must exist");
+        // `fixtures/` is git-ignored, so a clean checkout does not have this file.
+        let Ok(src) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present");
+            return;
+        };
         let mut e = engine_with_setup_files(vec![src]);
         // Pure helpers work without a process.
         let v = e
