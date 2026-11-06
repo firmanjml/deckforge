@@ -111,8 +111,9 @@ const MAPS_REFRESH: Duration = Duration::from_secs(1);
 /// Frozen addresses are refreshed periodically so dynamic game state can move
 /// without making expensive script resolvers run for every write tick.
 const ADDRESS_REFRESH: Duration = Duration::from_secs(1);
-/// After this many consecutive resolve failures, reset the script VM so
-/// script resolvers re-discover from scratch.
+/// After this many consecutive failures of one cheat, reset the script VM so
+/// script resolvers re-discover from scratch. A failure is often temporary (no
+/// player in a menu) and discovery can be expensive, so it is kept until then.
 const REINIT_FAILURES: u32 = 200;
 
 struct ResolvedFreeze {
@@ -125,7 +126,7 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
     let mut last_maps = Instant::now() - MAPS_REFRESH;
     let mut last_write: HashMap<String, Instant> = HashMap::new();
     let mut resolved: HashMap<String, ResolvedFreeze> = HashMap::new();
-    let mut failures: u32 = 0;
+    let mut failures: HashMap<String, u32> = HashMap::new();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -160,6 +161,7 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
         }
 
         resolved.retain(|id, _| items.iter().any(|(item_id, _, _, _)| item_id == id));
+        failures.retain(|id, _| items.iter().any(|(item_id, _, _, _)| item_id == id));
 
         if last_maps.elapsed() >= MAPS_REFRESH {
             if let Ok(m) = crate::process::modules::read_modules(pid) {
@@ -194,16 +196,16 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
                     }
                     Err(e) => {
                         resolved.remove(&id);
-                        failures += 1;
-                        if failures == 1 || failures % REINIT_FAILURES == 0 {
+                        let count = record_failure(&mut failures, &id);
+                        if should_log_failure(count) {
                             eprintln!(
                                 "[forge] freeze '{id}': resolve failed ({e}); will keep retrying"
                             );
-                            // Reset the script VM so cached discovery (if any) is
-                            // rebuilt against the current game state.
+                        }
+                        if should_reinit(count) {
                             scripts.lock().unwrap().reset();
                         }
-                        last_write.insert(id, now);
+                        last_write.insert(id, now + ADDRESS_REFRESH);
                         continue;
                     }
                 }
@@ -214,23 +216,57 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
             };
             match mem.write_bytes(addr, &bytes) {
                 Ok(()) => {
-                    failures = 0;
+                    failures.remove(&id);
                     last_write.insert(id, now);
                 }
                 Err(e) => {
                     resolved.remove(&id);
-                    failures += 1;
-                    if failures == 1 || failures % REINIT_FAILURES == 0 {
+                    let count = record_failure(&mut failures, &id);
+                    if should_log_failure(count) {
                         eprintln!("[forge] freeze '{id}': write failed ({e}); will re-resolve");
-                        // Reset the script VM so cached discovery (if any) is
-                        // rebuilt against the current game state.
+                    }
+                    if should_reinit(count) {
                         scripts.lock().unwrap().reset();
                     }
-                    last_write.insert(id, now);
+                    last_write.insert(id, now + ADDRESS_REFRESH);
                 }
             }
         }
 
         std::thread::sleep(TICK);
+    }
+}
+
+fn record_failure(failures: &mut HashMap<String, u32>, id: &str) -> u32 {
+    let count = failures.entry(id.to_string()).or_insert(0);
+    *count += 1;
+    *count
+}
+
+fn should_log_failure(count: u32) -> bool {
+    count == 1 || should_reinit(count)
+}
+
+fn should_reinit(count: u32) -> bool {
+    count % REINIT_FAILURES == 0
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn first_failure_keeps_script_state() {
+        assert!(should_log_failure(1));
+        assert!(!should_reinit(1));
+        assert!(should_reinit(REINIT_FAILURES));
+    }
+
+    #[test]
+    fn failures_are_counted_per_cheat() {
+        let mut failures = HashMap::new();
+        assert_eq!(record_failure(&mut failures, "a"), 1);
+        assert_eq!(record_failure(&mut failures, "a"), 2);
+        assert_eq!(record_failure(&mut failures, "b"), 1);
     }
 }
