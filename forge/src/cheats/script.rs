@@ -31,12 +31,11 @@ use std::sync::{Arc, Mutex};
 use mlua::{Lua, LuaOptions, StdLib, Value, Variadic};
 
 use crate::error::{EngineError, EngineResult};
+use crate::memory::ops::{find_bytes, scan_chunks};
 use crate::memory::{MemoryAccess, MemoryRegion};
 
 /// Largest single memory region a scan will touch.
 const MAX_SCAN_REGION: usize = 64 * 1024 * 1024;
-/// Scan chunk size (bounded read granularity).
-const SCAN_CHUNK: usize = 4 * 1024 * 1024;
 /// Result cap for scan_string / scan_pointers_to.
 const MAX_SCAN_RESULTS: usize = 4096;
 /// Cap for disasm_targets window.
@@ -453,29 +452,21 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
                     let (lo, hi) =
                         crate::memory::ops::module_span(&mem, &maps, &module).map_err(lua_err)?;
                     let mut out = Vec::new();
-                    for region in maps.iter() {
+                    'regions: for region in maps.iter() {
                         if !region.readable || region.size() > MAX_SCAN_REGION {
                             continue;
                         }
-                        let start = region.start.max(lo);
-                        let end = region.end.min(hi);
-                        if start >= end {
-                            continue;
-                        }
-                        let size = end - start;
-                        let mut offset = 0usize;
-                        while offset < size {
-                            let chunk = SCAN_CHUNK.min(size - offset);
-                            let base = start + offset;
-                            if let Ok(data) = mem.read_bytes(base, chunk) {
-                                for m in crate::resolver::signature::all_matches(&data, &pat) {
-                                    out.push((base + m) as i64);
-                                    if out.len() >= MAX_SCAN_RESULTS {
-                                        break;
-                                    }
+                        let (start, end) = (region.start.max(lo), region.end.min(hi));
+                        for (addr, len) in scan_chunks(start, end, pat.len() - 1) {
+                            let Ok(data) = mem.read_bytes(addr, len) else {
+                                continue;
+                            };
+                            for m in crate::resolver::signature::all_matches(&data, &pat) {
+                                out.push((addr + m) as i64);
+                                if out.len() >= MAX_SCAN_RESULTS {
+                                    break 'regions;
                                 }
                             }
-                            offset += chunk;
                         }
                     }
                     lua.create_sequence_from(out).map(Value::Table)
@@ -742,23 +733,7 @@ fn scan_impl(
         if rstart >= rend {
             continue;
         }
-        let rsize = rend - rstart;
-        let mut offset = 0usize;
-        while offset < rsize && hits.len() < MAX_SCAN_RESULTS {
-            let chunk = SCAN_CHUNK.min(rsize - offset);
-            let base = rstart + offset;
-            if let Ok(data) = mem.read_bytes(base, chunk) {
-                for (i, w) in data.windows(needle.len()).enumerate() {
-                    if (base + i) % align == 0 && w == needle {
-                        hits.push(base + i);
-                        if hits.len() >= MAX_SCAN_RESULTS {
-                            break;
-                        }
-                    }
-                }
-            }
-            offset += chunk;
-        }
+        find_bytes(mem, rstart, rend, needle, align, MAX_SCAN_RESULTS, &mut hits);
     }
     Ok(hits)
 }
@@ -974,5 +949,114 @@ mod tests {
             .resolve(&mem(), &[], "local s = trainer.symbol('nope') if s == nil then return 5 end return 0")
             .unwrap();
         assert_eq!(err, 5);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod live_tests {
+    use super::*;
+    use crate::memory::ops::SCAN_CHUNK;
+
+    const NEEDLE: [u8; 8] = [0xDE, 0xC0, 0xAD, 0x0B, 0x13, 0x37, 0xBE, 0xEF];
+
+    /// Own-process memory (no privileges needed) described by maps that cover
+    /// exactly one buffer, so chunk boundaries sit at known offsets.
+    struct Target {
+        buf: Vec<u8>,
+    }
+
+    impl Target {
+        fn new() -> Self {
+            Self {
+                buf: vec![0u8; SCAN_CHUNK + 0x1000],
+            }
+        }
+
+        fn base(&self) -> usize {
+            self.buf.as_ptr() as usize
+        }
+
+        fn plant(&mut self, off: usize, bytes: &[u8]) -> usize {
+            self.buf[off..off + bytes.len()].copy_from_slice(bytes);
+            std::hint::black_box(&mut self.buf);
+            self.base() + off
+        }
+
+        fn mem(&self) -> MemoryAccess {
+            MemoryAccess::new(std::process::id() as i32)
+        }
+
+        fn maps(&self) -> Vec<MemoryRegion> {
+            vec![MemoryRegion {
+                start: self.base(),
+                end: self.base() + self.buf.len(),
+                readable: true,
+                writable: true,
+                executable: false,
+                private: true,
+                path: Some("/games/game.exe".to_string()),
+            }]
+        }
+
+        fn lua(&self, code: &str) -> usize {
+            let session = Arc::new(Mutex::new(crate::trainer::session::TrainerSession::new()));
+            let mut e = ScriptEngine::new("game.exe", None, Vec::new(), session);
+            e.resolve(&self.mem(), &self.maps(), code).unwrap()
+        }
+    }
+
+    #[test]
+    fn scan_impl_reports_a_match_around_a_chunk_boundary_once() {
+        for before in 0..=NEEDLE.len() {
+            let mut t = Target::new();
+            let addr = t.plant(SCAN_CHUNK - before, &NEEDLE);
+            let hits = scan_impl(&t.mem(), &t.maps(), &NEEDLE, None, false, 1).unwrap();
+            assert_eq!(hits, [addr], "{before} bytes before the boundary");
+        }
+    }
+
+    #[test]
+    fn scan_impl_keeps_overlapping_matches_across_a_chunk_boundary() {
+        let mut t = Target::new();
+        let addr = t.plant(SCAN_CHUNK - 2, &[0xAB; 4]);
+        let hits = scan_impl(&t.mem(), &t.maps(), &[0xAB; 3], None, false, 1).unwrap();
+        assert_eq!(hits, [addr, addr + 1]);
+    }
+
+    #[test]
+    fn scan_impl_applies_alignment_across_a_chunk_boundary() {
+        let mut t = Target::new();
+        // Pick the aligned and unaligned planting offsets near the boundary.
+        let aligned = (t.base() + SCAN_CHUNK - 4) / 4 * 4 - t.base();
+        let addr = t.plant(aligned, &NEEDLE);
+        t.plant(aligned + 0x101, &NEEDLE);
+        let hits = scan_impl(&t.mem(), &t.maps(), &NEEDLE, None, false, 4).unwrap();
+        assert_eq!(hits, [addr]);
+    }
+
+    #[test]
+    fn scan_string_finds_a_string_across_a_chunk_boundary() {
+        let mut t = Target::new();
+        t.plant(SCAN_CHUNK - 3, b"chunk-straddler");
+        assert_eq!(t.lua("return #trainer.scan_string('chunk-straddler')"), 1);
+    }
+
+    #[test]
+    fn scan_pointers_to_finds_a_pointer_across_a_chunk_boundary() {
+        let mut t = Target::new();
+        // Module "game.exe" has no MZ header here, so pointers are 8 bytes.
+        let pointee: usize = 0x7ABC_DEF0_1234;
+        t.plant(SCAN_CHUNK - 3, &pointee.to_ne_bytes());
+        let code = format!("return #trainer.scan_pointers_to({pointee})");
+        assert_eq!(t.lua(&code), 1);
+    }
+
+    #[test]
+    fn scan_signature_all_finds_a_match_across_a_chunk_boundary_once() {
+        let mut t = Target::new();
+        t.plant(0x200, &NEEDLE);
+        t.plant(SCAN_CHUNK - 3, &NEEDLE);
+        let code = "return #trainer.scan_signature_all('game.exe', 'DE C0 AD 0B ?? ?? BE EF')";
+        assert_eq!(t.lua(code), 2);
     }
 }

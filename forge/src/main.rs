@@ -119,6 +119,27 @@ fn val<T: Serialize>(t: T) -> serde_json::Value {
     serde_json::to_value(t).unwrap_or(serde_json::Value::Null)
 }
 
+/// Scan ALL readable regions (including read-only data sections where
+/// GameMaker stores its strings, and module code sections) for `needle`.
+fn scan_string(
+    mem: &memory::MemoryAccess,
+    maps: &[memory::MemoryRegion],
+    needle: &[u8],
+    max: usize,
+) -> Vec<usize> {
+    let mut found = Vec::new();
+    for region in maps.iter().filter(|r| r.readable) {
+        if found.len() >= max {
+            break;
+        }
+        if region.size() > 64 * 1024 * 1024 {
+            continue;
+        }
+        memory::ops::find_bytes(mem, region.start, region.end, needle, 1, max, &mut found);
+    }
+    found
+}
+
 fn dispatch(state: &mut EngineState, cmd: &Command) -> EngineResult<serde_json::Value> {
     match cmd {
         Command::Ping => Ok(val(PingData {
@@ -386,46 +407,8 @@ fn dispatch(state: &mut EngineState, cmd: &Command) -> EngineResult<serde_json::
             state.ensure_alive()?;
             let mem = state.memory()?;
             let maps = state.maps_slice()?.to_vec();
-            let needle = pattern.as_bytes();
             let max = if *max_results == 0 { 100 } else { *max_results };
-            let mut found = Vec::new();
-
-            // Scan ALL readable regions (including read-only data sections where
-            // GameMaker stores its strings, and module code sections).
-            for region in maps.iter().filter(|r| r.readable) {
-                if found.len() >= max {
-                    break;
-                }
-                let size = region.size();
-                if size == 0 || size > 64 * 1024 * 1024 {
-                    continue;
-                }
-                const CHUNK: usize = 4 * 1024 * 1024;
-                let mut offset = 0usize;
-                while offset < size && found.len() < max {
-                    let chunk_size = CHUNK.min(size - offset);
-                    let addr = region.start + offset;
-                    match mem.read_bytes(addr, chunk_size) {
-                        Ok(data) => {
-                            let nlen = needle.len();
-                            if nlen == 0 || nlen > data.len() {
-                                offset += chunk_size;
-                                continue;
-                            }
-                            for (i, window) in data.windows(nlen).enumerate() {
-                                if window == needle {
-                                    found.push(addr + i);
-                                    if found.len() >= max {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Err(_) => {}
-                    }
-                    offset += chunk_size;
-                }
-            }
+            let found = scan_string(&mem, &maps, pattern.as_bytes(), max);
             let count = found.len();
             Ok(val(ScanStringData {
                 addresses: found,
@@ -535,5 +518,53 @@ fn dispatch(state: &mut EngineState, cmd: &Command) -> EngineResult<serde_json::
         Command::Shutdown => Ok(val(ShutdownData {
             message: "shutting down".into(),
         })),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod live_tests {
+    use super::*;
+    use memory::ops::SCAN_CHUNK;
+    use memory::MemoryAccess;
+
+    const NEEDLE: &[u8] = b"chunk-straddler";
+
+    /// Run the scan against a buffer in this process, which needs no privileges.
+    fn scan(buf: &mut Vec<u8>, needle: &[u8], max: usize) -> Vec<usize> {
+        std::hint::black_box(&mut *buf);
+        let start = buf.as_ptr() as usize;
+        let maps = [memory::MemoryRegion {
+            start,
+            end: start + buf.len(),
+            readable: true,
+            writable: true,
+            executable: false,
+            private: true,
+            path: None,
+        }];
+        scan_string(&MemoryAccess::new(std::process::id() as i32), &maps, needle, max)
+    }
+
+    #[test]
+    fn scan_string_reports_a_match_around_a_chunk_boundary_once() {
+        for before in 0..=NEEDLE.len() {
+            let mut buf = vec![0u8; SCAN_CHUNK + 0x1000];
+            let off = SCAN_CHUNK - before;
+            buf[off..off + NEEDLE.len()].copy_from_slice(NEEDLE);
+            let addr = buf.as_ptr() as usize + off;
+            assert_eq!(scan(&mut buf, NEEDLE, 100), [addr], "{before} bytes before");
+        }
+    }
+
+    #[test]
+    fn scan_string_stops_at_max_results() {
+        let mut buf = vec![0xABu8; 0x100];
+        assert_eq!(scan(&mut buf, &[0xAB], 3).len(), 3);
+    }
+
+    #[test]
+    fn scan_string_with_an_empty_needle_finds_nothing() {
+        let mut buf = vec![0u8; 0x100];
+        assert!(scan(&mut buf, b"", 100).is_empty());
     }
 }

@@ -151,6 +151,36 @@ pub(crate) fn loaded_modules(mem: &MemoryAccess, maps: &[MemoryRegion]) -> Vec<M
     modules
 }
 
+/// Append to `hits` every occurrence of `needle` in `[start, end)` at an address
+/// that is a multiple of `align`, stopping once `hits` holds `max` addresses.
+/// Overlapping occurrences all count; chunks that cannot be read are skipped.
+pub(crate) fn find_bytes(
+    mem: &MemoryAccess,
+    start: usize,
+    end: usize,
+    needle: &[u8],
+    align: usize,
+    max: usize,
+    hits: &mut Vec<usize>,
+) {
+    if needle.is_empty() {
+        return;
+    }
+    for (addr, len) in scan_chunks(start, end, needle.len() - 1) {
+        let Ok(data) = mem.read_bytes(addr, len) else {
+            continue;
+        };
+        for (i, window) in data.windows(needle.len()).enumerate() {
+            if (addr + i) % align == 0 && window == needle {
+                hits.push(addr + i);
+                if hits.len() >= max {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 impl<'a> MemoryOps for LiveMemory<'a> {
     fn read_bytes(&self, addr: usize, len: usize) -> EngineResult<Vec<u8>> {
         self.mem.read_bytes(addr, len)
