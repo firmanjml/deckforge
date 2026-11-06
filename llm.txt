@@ -597,7 +597,7 @@ Static package checks:
 [ ] game.process is the real Proton game executable.
 [ ] trainer.id and every cheat.id are unique and stable.
 [ ] JSON parses without comments or trailing commas.
-[ ] trainer.json validates against docs/trainer.schema.json.
+[ ] trainer.json validates against trainer.schema.json.
 [ ] Script paths are relative, use /, exist, and do not contain .. or drives.
 [ ] Every requires id exists in scripts.bootstrap.
 [ ] auto_assembler actions use control toggle.

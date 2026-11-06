@@ -281,16 +281,16 @@ All IDs should be stable, lowercase `snake_case`. Script paths must use forward 
 
 ### Validate with the JSON schema
 
-[`docs/trainer.schema.json`](docs/trainer.schema.json) describes `trainer.json`, so you can catch mistakes before starting a game. Add this line to get autocomplete and error highlighting in editors such as VS Code. Forge ignores it.
+[`trainer.schema.json`](trainer.schema.json) describes `trainer.json`, so you can catch mistakes before starting a game. Add this line to get autocomplete and error highlighting in editors such as VS Code. Forge ignores it.
 
 ```json
-"$schema": "https://raw.githubusercontent.com/firmanjml/deckforge/master/docs/trainer.schema.json"
+"$schema": "https://raw.githubusercontent.com/firmanjml/deckforge/master/trainer.schema.json"
 ```
 
 To check a file from the command line, on Windows or Linux:
 
 ```bash
-npx ajv-cli@5 validate --spec=draft2020 --strict=false -s docs/trainer.schema.json -d path/to/trainer.json
+npx ajv-cli@5 validate --spec=draft2020 --strict=false -s trainer.schema.json -d path/to/trainer.json
 ```
 
 The schema is stricter than Forge in places, so it also reports:

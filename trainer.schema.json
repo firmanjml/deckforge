@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/firmanjml/deckforge/master/docs/trainer.schema.json",
+  "$id": "https://raw.githubusercontent.com/firmanjml/deckforge/master/trainer.schema.json",
   "title": "DeckForge trainer",
   "description": "A DeckForge trainer.json file. Forge's loader remains the final check for rules a schema cannot express: the package directory matching steamAppId, unique cheat ids, requires naming a declared bootstrap component, script files existing, and patch expected and enabled having the same length.",
   "type": "object",

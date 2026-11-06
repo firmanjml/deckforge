@@ -134,7 +134,7 @@ executables.
 
 ## Package validation results
 
-- [ ] `trainers/<appid>/trainer.json` validates against `docs/trainer.schema.json`.
+- [ ] `trainers/<appid>/trainer.json` validates against `trainer.schema.json`.
 - [ ] `trainers/<appid>/trainer.json` parses and loads through Forge.
 - [ ] The package directory matches `game.steamAppId`.
 - [ ] All `.asm`/`.lua` paths are relative and resolve inside the package.
