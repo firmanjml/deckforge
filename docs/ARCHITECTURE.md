@@ -102,8 +102,8 @@ forge/src/
 
 Trainers are external runtime content, never bundled production code. Located by
 `<trainer_dir>/<appid>/trainer.json`. Override with `DECKFORGE_TRAINER_DIR`
-(default `./fixtures/trainers` for development; production points at the
-persistent DeckForge data directory).
+(under Decky, Relay defaults it to `$DECKY_PLUGIN_RUNTIME_DIR/trainers`, which
+survives plugin updates; outside Decky the default is `fixtures/trainers`).
 
 ## Error codes
 

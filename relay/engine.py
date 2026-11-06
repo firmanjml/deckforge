@@ -72,6 +72,23 @@ def resolve_binary_path() -> str:
     return os.path.join(root, "bin", "deckforge-engine")
 
 
+def resolve_trainer_dir(binary_path: str) -> str:
+    """Locate the directory holding installed trainer packages.
+
+    Order: ``DECKFORGE_TRAINER_DIR`` env var, then Decky's persistent runtime
+    directory (which survives plugin updates), then ``fixtures/trainers`` next
+    to the plugin for local development outside Decky.
+    """
+    override = os.environ.get("DECKFORGE_TRAINER_DIR")
+    if override:
+        return override
+    runtime_dir = os.environ.get("DECKY_PLUGIN_RUNTIME_DIR")
+    if runtime_dir:
+        return os.path.join(runtime_dir, "trainers")
+    plugin_dir = os.path.dirname(os.path.dirname(binary_path))
+    return os.path.join(plugin_dir, "fixtures", "trainers")
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -109,15 +126,7 @@ class Engine:
         path = resolve_binary_path()
         self._log(f"starting forge engine: {path}")
         try:
-            # Set trainer dir to the plugin's fixtures/trainers (dev) or
-            # a persistent data dir (production). This ensures the engine
-            # finds trainers regardless of its working directory.
-            import os
-            plugin_dir = os.path.dirname(os.path.dirname(path))
-            trainer_dir = os.environ.get(
-                "DECKFORGE_TRAINER_DIR",
-                os.path.join(plugin_dir, "fixtures", "trainers"),
-            )
+            trainer_dir = resolve_trainer_dir(path)
             env = dict(os.environ)
             env["DECKFORGE_TRAINER_DIR"] = trainer_dir
             self._log(f"trainer dir: {trainer_dir}")

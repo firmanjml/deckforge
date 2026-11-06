@@ -92,7 +92,7 @@ deckforge/
 └── llm.txt                  CE-table porting reference for coding agents
 ```
 
-Production trainer data is external to the plugin. The checked-in `fixtures/trainers/` tree is test and development content only.
+Production trainer data is external to the plugin: under Decky, trainers live in `$DECKY_PLUGIN_RUNTIME_DIR/trainers`, so plugin updates do not remove them. The git-ignored `fixtures/trainers/` tree is optional local development content, and a fresh clone does not include it.
 
 ## Build and test
 
@@ -128,7 +128,7 @@ Useful environment variables:
 | Variable | Purpose |
 |---|---|
 | `DECKFORGE_ENGINE_PATH` | Override the Forge executable used by Relay. |
-| `DECKFORGE_TRAINER_DIR` | Root containing one trainer package directory per Steam AppID. Defaults to `./fixtures/trainers` in development. |
+| `DECKFORGE_TRAINER_DIR` | Root containing one trainer package directory per Steam AppID. Under Decky it defaults to `$DECKY_PLUGIN_RUNTIME_DIR/trainers`; outside Decky it defaults to `fixtures/trainers`. |
 | `DECKFORGE_REPO_OWNER`, `DECKFORGE_REPO_NAME`, `DECKFORGE_REPO_REF` | Override the remote trainer catalog. |
 | `DECKFORGE_REPO_TOKEN` | Optional GitHub token for a higher API rate limit. |
 
@@ -526,7 +526,7 @@ Forge returns stable error codes such as:
 
 Auto Assembler errors include the trainer, cheat/component owner, script file, section, source line, command, and cause. Check Forge stderr for diagnostic detail; Cockpit intentionally shows only actionable messages.
 
-Useful fixture packages are under `fixtures/trainers/`. They demonstrate declarative patches and values, freezes, code injections, `readmem`, bootstrap components, shared symbols, and Lua resolvers. Treat their offsets and signatures as game/build-specific examples, not reusable constants.
+If you keep local fixture packages under the git-ignored `fixtures/trainers/`, they can demonstrate declarative patches and values, freezes, code injections, `readmem`, bootstrap components, shared symbols, and Lua resolvers. Treat their offsets and signatures as game/build-specific examples, not reusable constants.
 
 ## Trainer store
 

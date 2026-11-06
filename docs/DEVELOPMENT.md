@@ -74,8 +74,9 @@ Cockpit → Relay → Forge → response path.
 3. Copy `dist/`, `main.py`, `relay/`, `bin/deckforge-engine`, `plugin.json`,
    and (for dev) `fixtures/` into a Decky plugin directory, or use
    `scripts/deploy.sh` as a template.
-4. Set `DECKFORGE_TRAINER_DIR` to the persistent trainer directory in
-   production. For dev, leave it pointing at `fixtures/trainers`.
+4. Under Decky, trainers are stored in `$DECKY_PLUGIN_RUNTIME_DIR/trainers`
+   automatically. Set `DECKFORGE_TRAINER_DIR` to use a different directory, such
+   as a local `fixtures/trainers`.
 
 ## What requires a Steam Deck
 

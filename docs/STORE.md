@@ -217,13 +217,13 @@ trainer (once) when the job finishes and matches the attached game.
 Downloads are written into **`trainer::loader::trainer_dir()`** — the same
 directory Forge loads trainers from:
 
-- **Dev:** `./fixtures/trainers` (or `DECKFORGE_TRAINER_DIR`).
-- **Production:** the persistent DeckForge data directory (set
-  `DECKFORGE_TRAINER_DIR` when Relay spawns Forge — it already does).
+- **Under Decky:** `$DECKY_PLUGIN_RUNTIME_DIR/trainers`. Relay sets
+  `DECKFORGE_TRAINER_DIR` to this when it spawns Forge, so trainers survive
+  plugin updates.
+- **Outside Decky:** `fixtures/trainers`, unless `DECKFORGE_TRAINER_DIR` is set.
 
 Routing through `trainer_dir()` guarantees the store writes to *exactly* the
-path Forge reads from. To move to the production persistent directory later, set
-the env var — no code change.
+path Forge reads from.
 
 ## Atomic, safe installation
 
@@ -244,7 +244,7 @@ the env var — no code change.
 | `DECKFORGE_REPO_NAME` | `deckforge-trainers` | GitHub repo name |
 | `DECKFORGE_REPO_REF` | `main` | branch / ref |
 | `DECKFORGE_REPO_TOKEN` | *(none)* | optional PAT → 5000/hr API limit instead of 60/hr |
-| `DECKFORGE_TRAINER_DIR` | `./fixtures/trainers` | install target |
+| `DECKFORGE_TRAINER_DIR` | `$DECKY_PLUGIN_RUNTIME_DIR/trainers` under Decky, otherwise `fixtures/trainers` | install target |
 
 Forge inherits these from its environment (Relay spawns it with
 `env = dict(os.environ)`), so set them in the Decky/Relay environment.
