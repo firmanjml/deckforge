@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # An older Ubuntu links against an older glibc, so the engine also runs on
+    # SteamOS releases that are behind the newest runner image.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test Forge
+        run: cargo test --manifest-path forge/Cargo.toml
+
+      - name: Build and package
+        run: ./release.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Publish release
+        run: gh release create "$GITHUB_REF_NAME" deckforge.zip --title "DeckForge $GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
