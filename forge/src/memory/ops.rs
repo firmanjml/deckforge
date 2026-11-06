@@ -5,8 +5,11 @@
 //! process. [`LiveMemory`] adapts the engine's validated [`MemoryAccess`] +
 //! cached maps; [`MockMemory`] (tests only) is a flat in-memory backend.
 
+use std::collections::HashSet;
+
 use crate::error::{EngineError, EngineResult};
-use crate::memory::{module_base, MemoryAccess, MemoryRegion};
+use crate::memory::regions::is_module_path;
+use crate::memory::{find_module, module_base, MemoryAccess, MemoryRegion, ModuleInfo};
 use crate::resolver::signature::{all_matches, PatternByte};
 
 /// Cap on scan results returned by one AOB scan (safety valve; CE's aobscan
@@ -113,6 +116,32 @@ pub(crate) fn module_span(
                 .unwrap_or(base.saturating_add(64 * 1024 * 1024))
         });
     Ok((base, end))
+}
+
+/// Every file-backed module mapped into the process, with `end` taken from
+/// [`module_span`] so PE sections that Proton maps anonymously count as part of
+/// their module. Pseudo-paths such as `[heap]` are not modules.
+pub(crate) fn loaded_modules(mem: &MemoryAccess, maps: &[MemoryRegion]) -> Vec<ModuleInfo> {
+    let mut seen = HashSet::new();
+    let mut modules = Vec::new();
+    for path in maps
+        .iter()
+        .filter_map(|r| r.path.as_deref())
+        .filter(|p| is_module_path(p))
+    {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if !seen.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        if let (Some(mut info), Ok((base, end))) =
+            (find_module(maps, name), module_span(mem, maps, name))
+        {
+            info.base = base;
+            info.end = end;
+            modules.push(info);
+        }
+    }
+    modules
 }
 
 impl<'a> MemoryOps for LiveMemory<'a> {

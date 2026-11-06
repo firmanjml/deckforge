@@ -7,7 +7,7 @@
 
 use crate::error::{EngineError, EngineResult};
 use crate::memory::regions::is_scannable;
-use crate::memory::{MemoryAccess, MemoryRegion};
+use crate::memory::{MemoryAccess, MemoryRegion, ModuleInfo};
 
 /// Largest single region a scan reads. Regions are read in chunks, so this only
 /// guards against scanning huge reservations the game never touches.
@@ -116,24 +116,13 @@ pub fn next_scan(
     Ok(found)
 }
 
-/// Check whether an address falls within a mapped module (static) or is in
-/// heap/anonymous memory (dynamic). Returns (module_name, module_offset).
-pub fn classify_address(maps: &[MemoryRegion], addr: usize) -> Option<(String, usize)> {
-    for r in maps {
-        if addr >= r.start && addr < r.end {
-            if let Some(path) = &r.path {
-                let base = maps
-                    .iter()
-                    .filter(|m| m.path.as_deref() == Some(path))
-                    .map(|m| m.start)
-                    .min()?;
-                let name = path.rsplit('/').next().unwrap_or(path).to_string();
-                return Some((name, addr - base));
-            }
-            return None; // anonymous region
-        }
-    }
-    None
+/// Find the module containing `addr`, returning its name and the offset from
+/// its base. `None` means the address is in dynamic memory such as the heap.
+pub fn classify_address(modules: &[ModuleInfo], addr: usize) -> Option<(&str, usize)> {
+    modules
+        .iter()
+        .find(|m| addr >= m.base && addr < m.end)
+        .map(|m| (m.name.as_str(), addr - m.base))
 }
 
 fn scan_region(data: &[u8], base: usize, needle: &[u8], found: &mut Vec<usize>) {
@@ -175,6 +164,28 @@ fn encode_float(value: f64, width: usize) -> EngineResult<Vec<u8>> {
             )))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_counts_anonymous_sections_inside_a_module_span() {
+        // Only the PE header is file-backed, as under Proton; the span covers
+        // the rest of the image.
+        let modules = vec![ModuleInfo {
+            name: "Game.exe".into(),
+            base: 0x1_4000_0000,
+            end: 0x1_4100_0000,
+            regions: Vec::new(),
+        }];
+        assert_eq!(
+            classify_address(&modules, 0x1_4080_0010),
+            Some(("Game.exe", 0x80_0010))
+        );
+        assert_eq!(classify_address(&modules, 0x1_4100_0000), None);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

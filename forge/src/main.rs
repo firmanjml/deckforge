@@ -298,10 +298,13 @@ fn dispatch(state: &mut EngineState, cmd: &Command) -> EngineResult<serde_json::
         }
 
         Command::ScanClassify { address } => {
-            let maps = state.maps_slice()?;
+            state.ensure_alive()?;
+            state.refresh_maps();
+            let mem = state.memory()?;
+            let modules = crate::memory::ops::loaded_modules(&mem, state.maps_slice()?);
             let (module, module_offset, is_static) =
-                match crate::scanner::classify_address(maps, *address) {
-                    Some((name, off)) => (Some(name), Some(off), true),
+                match crate::scanner::classify_address(&modules, *address) {
+                    Some((name, off)) => (Some(name.to_string()), Some(off), true),
                     None => (None, None, false),
                 };
             Ok(val(ScanClassifyData {

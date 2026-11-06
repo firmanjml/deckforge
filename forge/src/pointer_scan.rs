@@ -5,7 +5,7 @@
 //! caps the number of level-1 pointers, and reads in chunks to avoid blocking.
 
 use crate::error::EngineResult;
-use crate::memory::{find_module, MemoryAccess, MemoryRegion, ModuleInfo};
+use crate::memory::{MemoryAccess, MemoryRegion, ModuleInfo};
 use serde::Serialize;
 
 const MAX_CHUNK: usize = 4 * 1024 * 1024; // 4MB chunks
@@ -42,19 +42,7 @@ pub fn scan_pointers(
 ) -> EngineResult<PointerScanResult> {
     let mut chains = Vec::new();
 
-    // Collect all mapped modules for static checking.
-    let mut found_modules: Vec<ModuleInfo> = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
-    for r in maps {
-        if let Some(path) = &r.path {
-            let name = path.rsplit('/').next().unwrap_or(path).to_string();
-            if seen_names.insert(name.clone()) {
-                if let Some(info) = find_module(maps, &name) {
-                    found_modules.push(info);
-                }
-            }
-        }
-    }
+    let found_modules = crate::memory::ops::loaded_modules(mem, maps);
 
     // Level 1: find all pointers to target ± max_offset in ALL readable+writable memory
     let level1_ptrs = find_pointers_to(mem, maps, target, max_offset, false)?;
