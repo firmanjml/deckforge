@@ -342,6 +342,7 @@ impl TrainerRuntime {
         maps: &[MemoryRegion],
     ) -> EngineResult<Value> {
         let i = self.index_of(cheat_id)?;
+        self.def.cheats[i].check_range(value)?;
         let action = self.def.cheats[i].action.clone();
         match action {
             CheatAction::Value {

@@ -181,6 +181,17 @@ mod tests {
     }
 
     #[test]
+    fn value_range_is_enforced() {
+        let def: TrainerDefinition = serde_json::from_str(sample_trainer_json()).unwrap();
+        let money = def.cheats.iter().find(|c| c.id == "money").unwrap();
+        assert!(money.check_range(&serde_json::json!(0)).is_ok());
+        assert!(money.check_range(&serde_json::json!(999999999)).is_ok());
+        assert!(money.check_range(&serde_json::json!(-1)).is_err());
+        assert!(money.check_range(&serde_json::json!(1000000000)).is_err());
+        assert!(money.check_range(&serde_json::json!("10")).is_err());
+    }
+
+    #[test]
     fn rejects_scan_resolver() {
         let json = r#"{
           "formatVersion": 1,

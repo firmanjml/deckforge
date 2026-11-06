@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::error::{EngineError, EngineResult};
 use crate::resolver::{HexValue, Resolver};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +128,27 @@ pub struct CheatDefinition {
     #[serde(default)]
     pub requires: Vec<String>,
     pub action: CheatAction,
+}
+
+impl CheatDefinition {
+    /// Reject a value outside the cheat's declared `min`/`max`.
+    pub fn check_range(&self, value: &serde_json::Value) -> EngineResult<()> {
+        let Some(number) = value.as_f64() else {
+            return Err(EngineError::InvalidRequest(format!(
+                "cheat '{}' needs a number, got {value}",
+                self.id
+            )));
+        };
+        let below = self.min.is_some_and(|min| number < min);
+        let above = self.max.is_some_and(|max| number > max);
+        if below || above {
+            return Err(EngineError::InvalidRequest(format!(
+                "{number} is outside the allowed range for '{}' (min {:?}, max {:?})",
+                self.name, self.min, self.max
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
