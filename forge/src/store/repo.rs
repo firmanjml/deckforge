@@ -11,6 +11,8 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -18,6 +20,12 @@ use crate::error::{EngineError, EngineResult};
 
 const USER_AGENT: &str = "deckforge-engine";
 const TTL_SECS: u64 = 600;
+/// Time to establish a TCP connection, across all of a host's addresses.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longest wait for any one read of the TLS handshake or response, or any write.
+/// A fetch that stalls costs at most this plus [`CONNECT_TIMEOUT`], and the
+/// failure ends the whole store operation.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Repository location + optional auth. Defaults point at the public
 /// `firmanjml/deckforge-trainers` repo on `main`; every field is overridable
@@ -121,9 +129,35 @@ struct MetaTrainer {
 // HTTP
 // ---------------------------------------------------------------------------
 
-fn http_get(cfg: &RepoConfig, url: &str, accept: &str) -> EngineResult<ureq::Response> {
+/// One agent for every store request. The store runs on the engine's stdin loop
+/// (and Relay gives up on a request after 15 s), so a stalled connection must end
+/// in an error rather than block it.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| build_agent(CONNECT_TIMEOUT, READ_TIMEOUT))
+}
+
+fn build_agent(connect: Duration, read: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(connect)
+        .timeout_read(read)
+        .timeout_write(read)
+        // ureq clears the read timeout of a connection it returns to the pool, so
+        // a stall on a reused connection would never time out. Every request gets
+        // its own connection, as it did before there was a shared agent.
+        .max_idle_connections(0)
+        .build()
+}
+
+fn http_get(
+    agent: &ureq::Agent,
+    cfg: &RepoConfig,
+    url: &str,
+    accept: &str,
+) -> EngineResult<ureq::Response> {
     // ureq 2's `Request::set` consumes and returns `self`, so we chain.
-    let req = ureq::get(url)
+    let req = agent
+        .get(url)
         .set("User-Agent", USER_AGENT)
         .set("Accept", accept);
     let req = if let Some(tok) = &cfg.token {
@@ -134,19 +168,37 @@ fn http_get(cfg: &RepoConfig, url: &str, accept: &str) -> EngineResult<ureq::Res
     req.call().map_err(|e| map_http_err(e, url))
 }
 
-fn get_text(cfg: &RepoConfig, url: &str, accept: &str) -> EngineResult<String> {
-    let resp = http_get(cfg, url, accept)?;
+fn get_text_with(
+    agent: &ureq::Agent,
+    cfg: &RepoConfig,
+    url: &str,
+    accept: &str,
+) -> EngineResult<String> {
+    let resp = http_get(agent, cfg, url, accept)?;
     resp.into_string()
         .map_err(|e| EngineError::RepoNetworkError(format!("read body {url}: {e}")))
 }
 
-fn get_bytes(cfg: &RepoConfig, url: &str, accept: &str) -> EngineResult<Vec<u8>> {
-    let resp = http_get(cfg, url, accept)?;
+fn get_bytes_with(
+    agent: &ureq::Agent,
+    cfg: &RepoConfig,
+    url: &str,
+    accept: &str,
+) -> EngineResult<Vec<u8>> {
+    let resp = http_get(agent, cfg, url, accept)?;
     let mut buf = Vec::new();
     resp.into_reader()
         .read_to_end(&mut buf)
         .map_err(|e| EngineError::RepoNetworkError(format!("read body {url}: {e}")))?;
     Ok(buf)
+}
+
+fn get_text(cfg: &RepoConfig, url: &str, accept: &str) -> EngineResult<String> {
+    get_text_with(agent(), cfg, url, accept)
+}
+
+fn get_bytes(cfg: &RepoConfig, url: &str, accept: &str) -> EngineResult<Vec<u8>> {
+    get_bytes_with(agent(), cfg, url, accept)
 }
 
 fn map_http_err(e: ureq::Error, url: &str) -> EngineError {
@@ -264,6 +316,8 @@ pub fn build_catalog(cfg: &RepoConfig, tree: &TreeResponse) -> EngineResult<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
 
     fn tree_json(entries: &[(&str, &str)]) -> String {
         let items: Vec<String> = entries
@@ -302,5 +356,111 @@ mod tests {
         assert!(!cfg.git_ref.is_empty());
         assert!(cfg.api_base().starts_with("https://api.github.com/repos/"));
         assert!(cfg.raw_base().contains("raw.githubusercontent.com"));
+    }
+
+    // --- timeouts, against a local server that stalls --------------------------
+
+    const SHORT: Duration = Duration::from_millis(200);
+    const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+    /// Serve one scripted reply per connection, reading the request first, then
+    /// hold each connection open without sending anything more.
+    fn stalling_server(replies: Vec<&'static [u8]>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for reply in replies {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let _ = conn.read(&mut request);
+                conn.write_all(reply).unwrap();
+                held.push(conn);
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    /// Run `f` off the test thread, failing the test rather than hanging it.
+    fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()));
+        rx.recv_timeout(limit).expect("request hung past its timeouts")
+    }
+
+    fn config() -> RepoConfig {
+        RepoConfig {
+            owner: "o".into(),
+            repo: "r".into(),
+            git_ref: "main".into(),
+            token: None,
+        }
+    }
+
+    #[test]
+    fn stalled_response_headers_are_a_network_error() {
+        let url = stalling_server(vec![b""]);
+        let agent = build_agent(SHORT, SHORT);
+        let err = within(Duration::from_secs(5), move || {
+            get_text_with(&agent, &config(), &url, "text/plain").unwrap_err()
+        });
+        assert!(matches!(err, EngineError::RepoNetworkError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn stalled_response_body_is_a_network_error() {
+        let url = stalling_server(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\npart"]);
+        let agent = build_agent(SHORT, SHORT);
+        let err = within(Duration::from_secs(5), move || {
+            get_bytes_with(&agent, &config(), &url, "application/octet-stream").unwrap_err()
+        });
+        assert!(matches!(err, EngineError::RepoNetworkError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn stall_on_a_later_request_of_a_shared_agent_is_a_network_error() {
+        // ureq clears a connection's read timeout when it returns to the pool.
+        let url = stalling_server(vec![OK_RESPONSE, b""]);
+        let agent = build_agent(SHORT, SHORT);
+        let err = within(Duration::from_secs(5), move || {
+            let first = get_text_with(&agent, &config(), &url, "text/plain").unwrap();
+            assert_eq!(first, "ok");
+            get_text_with(&agent, &config(), &url, "text/plain").unwrap_err()
+        });
+        assert!(matches!(err, EngineError::RepoNetworkError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn refused_connection_is_a_network_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let agent = build_agent(SHORT, SHORT);
+        let url = format!("http://127.0.0.1:{port}/");
+        let err = get_text_with(&agent, &config(), &url, "text/plain").unwrap_err();
+        assert!(matches!(err, EngineError::RepoNetworkError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn http_statuses_keep_their_structured_errors() {
+        let not_found: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        let limited: &[u8] =
+            b"HTTP/1.1 403 Forbidden\r\nx-ratelimit-remaining: 0\r\nContent-Length: 0\r\n\r\n";
+        let agent = build_agent(SHORT, SHORT);
+
+        let url = stalling_server(vec![not_found]);
+        let err = get_text_with(&agent, &config(), &url, "text/plain").unwrap_err();
+        assert!(matches!(err, EngineError::RepoNotFound), "{err:?}");
+
+        let url = stalling_server(vec![limited]);
+        let err = get_text_with(&agent, &config(), &url, "text/plain").unwrap_err();
+        assert!(matches!(err, EngineError::RepoRateLimited), "{err:?}");
+    }
+
+    #[test]
+    fn one_stall_stays_well_under_the_relay_request_timeout() {
+        const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+        assert!(CONNECT_TIMEOUT + READ_TIMEOUT <= RELAY_REQUEST_TIMEOUT * 2 / 3);
     }
 }
