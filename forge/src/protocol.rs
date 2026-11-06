@@ -320,6 +320,7 @@ pub struct WriteValueData {
 pub struct PointerScanData {
     pub chains: Vec<crate::pointer_scan::PointerChain>,
     pub total_found: usize,
+    pub truncated: bool,
 }
 
 fn default_depth() -> usize {

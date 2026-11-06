@@ -380,6 +380,7 @@ fn dispatch(state: &mut EngineState, cmd: &Command) -> EngineResult<serde_json::
             max_offset,
         } => {
             state.ensure_alive()?;
+            state.refresh_maps();
             let mem = state.memory()?;
             let maps = state.maps_slice()?.to_vec();
             let result =
@@ -387,6 +388,7 @@ fn dispatch(state: &mut EngineState, cmd: &Command) -> EngineResult<serde_json::
             Ok(val(PointerScanData {
                 chains: result.chains,
                 total_found: result.total_found,
+                truncated: result.truncated,
             }))
         }
 
