@@ -32,6 +32,7 @@ use mlua::{Lua, LuaOptions, StdLib, Value, Variadic};
 
 use crate::error::{EngineError, EngineResult};
 use crate::memory::ops::{find_bytes, scan_chunks};
+use crate::memory::regions::ReadableRanges;
 use crate::memory::{MemoryAccess, MemoryRegion};
 
 /// Largest single memory region a scan will touch.
@@ -78,6 +79,8 @@ struct Ctx {
     module: String,
     /// Shared so that a Lua API call does not copy the whole memory map.
     maps: Arc<Vec<MemoryRegion>>,
+    /// Lookup built from `maps`, for skipping reads that could only fail.
+    readable: Arc<ReadableRanges>,
     /// Pointer size of the attached process, read once from its PE header.
     pointer_size: Option<usize>,
     session: Arc<Mutex<crate::trainer::session::TrainerSession>>,
@@ -123,6 +126,7 @@ impl ScriptEngine {
             }
             ctx.pid = mem.pid;
             ctx.maps = Arc::new(maps.to_vec());
+            ctx.readable = Arc::new(ReadableRanges::new(maps));
         }
         let started = std::time::Instant::now();
         let result = vm.lua.load(code).set_name("resolver").eval::<Value>();
@@ -148,6 +152,7 @@ impl ScriptEngine {
             pid: 0,
             module: self.module.clone(),
             maps: Arc::new(Vec::new()),
+            readable: Arc::default(),
             pointer_size: None,
             session: Arc::clone(&self.session),
         }));
@@ -589,8 +594,9 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             lua.create_function(move |lua, addr: i64| {
                 let addr = to_addr(addr)?;
                 let (mem, maps) = snapshot(&c);
+                let readable = Arc::clone(&c.lock().unwrap().readable);
                 let is64 = pointer_size(&c)? == 8;
-                match rtti_class_name(&mem, &maps, addr, is64) {
+                match rtti_class_name(&mem, &maps, &readable, addr, is64) {
                     Some(name) => Ok(Value::String(lua.create_string(&name)?)),
                     None => Ok(Value::Nil),
                 }
@@ -740,29 +746,41 @@ fn scan_impl(
 
 /// MSVC RTTI class name of the object at `obj` — port of the Rust
 /// implementation formerly in the gamemaker resolver (CE `getRTTIClassName`).
+///
+/// Scripts probe many values that are not pointers, so each step first checks
+/// `readable` and skips a syscall that could only fail.
 fn rtti_class_name(
     mem: &MemoryAccess,
     maps: &[MemoryRegion],
+    readable: &ReadableRanges,
     obj: usize,
     is64: bool,
 ) -> Option<String> {
     let ps = if is64 { 8 } else { 4 };
-    let read_ptr = |a: usize| -> Option<usize> {
-        if is64 {
-            mem.read_u64(a).ok().map(|v| v as usize)
-        } else {
-            mem.read_u32(a).ok().map(|v| v as usize)
+    let read_u32 = |a: usize| -> Option<u32> {
+        if !readable.contains(a) {
+            return None;
         }
+        mem.read_u32(a).ok()
+    };
+    let read_ptr = |a: usize| -> Option<usize> {
+        if !is64 {
+            return read_u32(a).map(|v| v as usize);
+        }
+        if !readable.contains(a) {
+            return None;
+        }
+        mem.read_u64(a).ok().map(|v| v as usize)
     };
     let vftable = read_ptr(obj)?;
     let col = read_ptr(vftable.checked_sub(ps)?)?;
 
-    let signature = mem.read_u32(col).ok()?;
+    let signature = read_u32(col)?;
     let td = if is64 {
         if signature != 1 {
             return None;
         }
-        let td_rva = mem.read_u32(col + 0x0C).ok()? as usize;
+        let td_rva = read_u32(col + 0x0C)? as usize;
         image_base_for(maps, col)?.checked_add(td_rva)?
     } else {
         if signature != 0 {
@@ -771,8 +789,11 @@ fn rtti_class_name(
         read_ptr(col + 0x0C)?
     };
 
-    let name_off = if is64 { 0x10 } else { 0x08 };
-    let bytes = mem.read_bytes(td + name_off, 128).ok()?;
+    let name = td + if is64 { 0x10 } else { 0x08 };
+    if !readable.contains(name) {
+        return None;
+    }
+    let bytes = mem.read_bytes(name, 128).ok()?;
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     if end == 0 {
         return None;
@@ -1032,6 +1053,237 @@ mod live_tests {
         t.plant(aligned + 0x101, &NEEDLE);
         let hits = scan_impl(&t.mem(), &t.maps(), &NEEDLE, None, false, 4).unwrap();
         assert_eq!(hits, [addr]);
+    }
+
+    /// A writable anonymous mapping of one page, followed by an inaccessible
+    /// page so that the address just past it is known to fail.
+    struct Mapping {
+        base: *mut u8,
+    }
+
+    impl Mapping {
+        fn new(hint: usize) -> Self {
+            // SAFETY: the kernel picks where to map, treating `hint` as advice;
+            // the result is used only through `base` and unmapped on drop.
+            let base = unsafe {
+                let base = libc::mmap(
+                    hint as *mut libc::c_void,
+                    2 * PAGE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                assert_ne!(base, libc::MAP_FAILED);
+                let guard = base.cast::<u8>().add(PAGE);
+                assert_eq!(libc::mprotect(guard.cast(), PAGE, libc::PROT_NONE), 0);
+                base
+            };
+            Self { base: base.cast() }
+        }
+
+        fn start(&self) -> usize {
+            self.base as usize
+        }
+
+        fn write(&self, off: usize, bytes: &[u8]) {
+            assert!(off + bytes.len() <= PAGE);
+            // SAFETY: inside the writable page, per the assert.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), bytes.len()) };
+        }
+
+        fn region(&self, readable: bool) -> MemoryRegion {
+            MemoryRegion {
+                start: self.start(),
+                end: self.start() + PAGE,
+                readable,
+                writable: readable,
+                executable: false,
+                private: true,
+                path: Some("/games/game.exe".to_string()),
+            }
+        }
+    }
+
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            // SAFETY: `base` is the start of a live mapping of two pages.
+            unsafe { libc::munmap(self.base.cast(), 2 * PAGE) };
+        }
+    }
+
+    const CLASS: &[u8] = b".?AVPlayer@@\0";
+    const PAGE: usize = 0x1000;
+    const OBJ: usize = 0x100;
+
+    /// One mapped image holding an MSVC x64 RTTI chain from `OBJ` to `CLASS`.
+    fn rtti_image64() -> Mapping {
+        let image = Mapping::new(0);
+        let base = image.start();
+        let (vftable, col, td) = (0x200, 0x300, 0x400);
+        image.write(OBJ, &(base + vftable).to_ne_bytes());
+        image.write(vftable - 8, &(base + col).to_ne_bytes());
+        image.write(col, &1u32.to_ne_bytes());
+        image.write(col + 0x0C, &(td as u32).to_ne_bytes());
+        image.write(td + 0x10, CLASS);
+        image
+    }
+
+    fn own_memory() -> MemoryAccess {
+        MemoryAccess::new(std::process::id() as i32)
+    }
+
+    fn class64(maps: &[MemoryRegion], readable: &ReadableRanges, obj: usize) -> Option<String> {
+        rtti_class_name(&own_memory(), maps, readable, obj, true)
+    }
+
+    /// A lookup that lets every read through, as if there were no check.
+    fn everything_readable() -> ReadableRanges {
+        ReadableRanges::new(&[MemoryRegion {
+            start: 0,
+            end: usize::MAX,
+            readable: true,
+            writable: false,
+            executable: false,
+            private: true,
+            path: None,
+        }])
+    }
+
+    #[test]
+    fn rtti_names_the_class_of_a_mapped_object() {
+        let image = rtti_image64();
+        let maps = [image.region(true)];
+        let obj = image.start() + OBJ;
+        let name = class64(&maps, &ReadableRanges::new(&maps), obj);
+        assert_eq!(name.as_deref(), Some(".?AVPlayer@@"));
+    }
+
+    #[test]
+    fn rtti_skips_the_read_for_an_address_outside_the_maps() {
+        // The memory is really readable, so a None can only come from the check.
+        let image = rtti_image64();
+        let maps = [image.region(true)];
+        let obj = image.start() + OBJ;
+        assert!(class64(&maps, &everything_readable(), obj).is_some());
+        assert!(class64(&maps, &ReadableRanges::new(&[]), obj).is_none());
+        assert!(class64(&maps, &ReadableRanges::new(&[image.region(false)]), obj).is_none());
+    }
+
+    #[test]
+    fn rtti_finds_the_same_names_with_unsorted_maps() {
+        let image = rtti_image64();
+        let other = Mapping::new(0);
+        let elsewhere = {
+            let mut r = other.region(true);
+            r.path = None;
+            r
+        };
+        let mut maps = [image.region(true), elsewhere];
+        maps.sort_by_key(|r| std::cmp::Reverse(r.start));
+        let name = class64(&maps, &ReadableRanges::new(&maps), image.start() + OBJ);
+        assert_eq!(name.as_deref(), Some(".?AVPlayer@@"));
+    }
+
+    #[test]
+    fn rtti_keeps_a_name_that_ends_at_the_end_of_a_mapping() {
+        // The 128-byte name read comes back short, which must still succeed.
+        let image = Mapping::new(0);
+        let base = image.start();
+        let (vftable, col) = (0x200, 0x300);
+        let td = PAGE - 0x10 - CLASS.len();
+        image.write(OBJ, &(base + vftable).to_ne_bytes());
+        image.write(vftable - 8, &(base + col).to_ne_bytes());
+        image.write(col, &1u32.to_ne_bytes());
+        image.write(col + 0x0C, &(td as u32).to_ne_bytes());
+        image.write(td + 0x10, CLASS);
+
+        let maps = [image.region(true)];
+        let name = class64(&maps, &ReadableRanges::new(&maps), base + OBJ);
+        assert_eq!(name.as_deref(), Some(".?AVPlayer@@"));
+    }
+
+    #[test]
+    fn rtti_results_match_unchecked_reads_for_every_way_a_chain_can_end() {
+        let image = rtti_image64();
+        let base = image.start();
+        // Chains that end at each step, on readable and on unreadable memory.
+        let hole = base + PAGE;
+        image.write(0x500, &0usize.to_ne_bytes()); // null vftable
+        image.write(0x510, &hole.to_ne_bytes()); // vftable - 8 is the last word mapped
+        image.write(0x518, &(hole + 0x10).to_ne_bytes()); // vftable unreadable
+        image.write(0x520, &(base + 0x600).to_ne_bytes()); // COL unreadable
+        image.write(0x600 - 8, &hole.to_ne_bytes());
+        image.write(0x530, &(base + 0x700).to_ne_bytes()); // wrong COL signature
+        image.write(0x700 - 8, &(base + 0x710).to_ne_bytes());
+        image.write(0x710, &7u32.to_ne_bytes());
+        image.write(0x540, &(base + 0x800).to_ne_bytes()); // name unreadable
+        image.write(0x800 - 8, &(base + 0x810).to_ne_bytes());
+        image.write(0x810, &1u32.to_ne_bytes());
+        image.write(0x810 + 0x0C, &(PAGE as u32).to_ne_bytes());
+        image.write(0x550, &(base + 0x900).to_ne_bytes()); // empty name
+        image.write(0x900 - 8, &(base + 0x910).to_ne_bytes());
+        image.write(0x910, &1u32.to_ne_bytes());
+        image.write(0x910 + 0x0C, &0xA00u32.to_ne_bytes());
+
+        let maps = [image.region(true)];
+        let checked = ReadableRanges::new(&maps);
+        let unchecked = everything_readable();
+        for obj in [OBJ, 0x500, 0x510, 0x518, 0x520, 0x530, 0x540, 0x550, 0xFFC] {
+            let obj = base + obj;
+            assert_eq!(
+                class64(&maps, &checked, obj),
+                class64(&maps, &unchecked, obj),
+                "object at 0x{obj:X}"
+            );
+        }
+        for obj in [0, 0x10, hole, usize::MAX - 8] {
+            assert!(class64(&maps, &checked, obj).is_none(), "0x{obj:X}");
+            assert!(class64(&maps, &unchecked, obj).is_none(), "0x{obj:X}");
+        }
+        assert_eq!(class64(&maps, &checked, base + OBJ).as_deref(), Some(".?AVPlayer@@"));
+    }
+
+    #[test]
+    fn rtti_follows_a_32_bit_chain() {
+        // 32-bit pointers need memory below 4 GiB, which the hint usually gets.
+        let image = Mapping::new(0x2000_0000);
+        let Ok(base) = u32::try_from(image.start()) else {
+            eprintln!("skipping: no mapping below 4 GiB");
+            return;
+        };
+        let (vftable, col, td) = (0x200u32, 0x300u32, 0x400u32);
+        image.write(OBJ, &(base + vftable).to_ne_bytes());
+        image.write(vftable as usize - 4, &(base + col).to_ne_bytes());
+        image.write(col as usize, &0u32.to_ne_bytes());
+        image.write(col as usize + 0x0C, &(base + td).to_ne_bytes());
+        image.write(td as usize + 0x08, CLASS);
+
+        let maps = [image.region(true)];
+        let obj = image.start() + OBJ;
+        let name = rtti_class_name(&own_memory(), &maps, &ReadableRanges::new(&maps), obj, false);
+        assert_eq!(name.as_deref(), Some(".?AVPlayer@@"));
+        let skipped = rtti_class_name(&own_memory(), &maps, &ReadableRanges::new(&[]), obj, false);
+        assert!(skipped.is_none());
+    }
+
+    #[test]
+    fn lua_rtti_class_name_uses_the_lookup_for_the_current_maps() {
+        let image = rtti_image64();
+        let session = Arc::new(Mutex::new(crate::trainer::session::TrainerSession::new()));
+        let mut e = ScriptEngine::new("game.exe", None, Vec::new(), session);
+        let obj = image.start() + OBJ;
+        let code = format!(
+            "local n = trainer.rtti_class_name({obj}) \
+             if n == '.?AVPlayer@@' then return 1 elseif n == nil then return 2 end return 3"
+        );
+        let mut maps = vec![image.region(true)];
+        assert_eq!(e.resolve(&own_memory(), &maps, &code).unwrap(), 1);
+
+        // The new maps no longer cover the object, only the module header.
+        maps[0].start = image.start();
+        maps[0].end = image.start() + OBJ;
+        assert_eq!(e.resolve(&own_memory(), &maps, &code).unwrap(), 2);
     }
 
     #[test]

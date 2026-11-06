@@ -178,6 +178,38 @@ pub fn find_module(regions: &[MemoryRegion], module: &str) -> Option<ModuleInfo>
     })
 }
 
+/// Sorted lookup of the addresses a process can read, built once per set of
+/// maps so that callers can skip a read that could only fail. Sorts and merges
+/// its input, because not every caller's maps are in address order.
+#[derive(Debug, Default)]
+pub struct ReadableRanges(Vec<(usize, usize)>);
+
+impl ReadableRanges {
+    pub fn new(regions: &[MemoryRegion]) -> Self {
+        let mut sorted: Vec<(usize, usize)> = regions
+            .iter()
+            .filter(|r| r.readable && r.start < r.end)
+            .map(|r| (r.start, r.end))
+            .collect();
+        sorted.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+        for (start, end) in sorted {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        Self(merged)
+    }
+
+    /// Does `addr` fall in a readable region? A read starting anywhere else
+    /// fails, whereas one starting here can still return a shorter result.
+    pub fn contains(&self, addr: usize) -> bool {
+        let next = self.0.partition_point(|&(_, end)| end <= addr);
+        self.0.get(next).is_some_and(|&(start, _)| start <= addr)
+    }
+}
+
 pub fn readable_regions(regions: &[MemoryRegion]) -> Vec<&MemoryRegion> {
     regions.iter().filter(|r| r.readable).collect()
 }
@@ -287,6 +319,66 @@ mod tests {
         assert!(!is_scannable(&region("r--p", "/opt/game/Game.exe")));
         assert!(!is_scannable(&region("rw-p", "[stack]")));
         assert!(!is_scannable(&region("rw-s", "/dev/dri/renderD128")));
+    }
+
+    fn readable_ranges(maps: &str) -> ReadableRanges {
+        ReadableRanges::new(&parse_maps(maps))
+    }
+
+    #[test]
+    fn readable_ranges_cover_exactly_the_readable_addresses() {
+        let ranges = readable_ranges(
+            "1000-2000 r--p 0 00:00 0\n\
+             3000-4000 ---p 0 00:00 0\n\
+             5000-6000 rw-p 0 00:00 0\n",
+        );
+        for (addr, expected) in [
+            (0x0, false),
+            (0xFFF, false),
+            (0x1000, true),
+            (0x1FFF, true),
+            (0x2000, false),
+            (0x3000, false),
+            (0x3FFF, false),
+            (0x4FFF, false),
+            (0x5000, true),
+            (0x5FFF, true),
+            (0x6000, false),
+            (usize::MAX, false),
+        ] {
+            assert_eq!(ranges.contains(addr), expected, "0x{addr:X}");
+        }
+    }
+
+    #[test]
+    fn readable_ranges_do_not_assume_sorted_input() {
+        let ranges = readable_ranges(
+            "5000-6000 r--p 0 00:00 0\n\
+             1000-2000 r--p 0 00:00 0\n\
+             3000-4000 r--p 0 00:00 0\n",
+        );
+        for addr in [0x1000, 0x3000, 0x5000] {
+            assert!(ranges.contains(addr), "0x{addr:X}");
+        }
+        for addr in [0x2000, 0x4000, 0x6000] {
+            assert!(!ranges.contains(addr), "0x{addr:X}");
+        }
+    }
+
+    #[test]
+    fn readable_ranges_merge_touching_and_overlapping_regions() {
+        let ranges = readable_ranges(
+            "1000-2000 r--p 0 00:00 0\n\
+             2000-3000 rw-p 0 00:00 0\n\
+             1800-1900 r--p 0 00:00 0\n",
+        );
+        assert_eq!(ranges.0, [(0x1000, 0x3000)]);
+    }
+
+    #[test]
+    fn readable_ranges_of_nothing_contain_nothing() {
+        assert!(!ReadableRanges::new(&[]).contains(0x1000));
+        assert!(!readable_ranges("1000-1000 r--p 0 00:00 0\n").contains(0x1000));
     }
 
     #[test]
