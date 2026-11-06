@@ -2,7 +2,7 @@
 //! and re-writes frozen values ("Infinite Health", "Infinite Ammo", ...).
 //!
 //! Design (per AGENTS.md): one central manager, no per-freeze threads. The
-//! thread re-resolves every tick, so room transitions, save loads, and
+//! thread re-resolves periodically, so room transitions, save loads, and
 //! title→game state changes are all handled automatically — a frozen value
 //! follows the game state instead of going stale. All freezes stop when the
 //! game exits or the trainer resets.
@@ -127,7 +127,8 @@ const TICK: Duration = Duration::from_millis(25);
 /// Maps are re-read this often (the game keeps allocating as it runs).
 const MAPS_REFRESH: Duration = Duration::from_secs(1);
 /// Frozen addresses are refreshed periodically so dynamic game state can move
-/// without making expensive script resolvers run for every write tick.
+/// without making expensive script resolvers run for every write tick. Signature
+/// addresses are exempt; see [`needs_resolve`].
 const ADDRESS_REFRESH: Duration = Duration::from_secs(1);
 /// A failed cheat resets the script VM so script resolvers re-discover against
 /// the current game state, for example once a player exists. Discovery can be
@@ -136,7 +137,30 @@ const REINIT_COOLDOWN: Duration = Duration::from_secs(30);
 
 struct ResolvedFreeze {
     addr: usize,
+    pid: i32,
     resolved_at: Instant,
+}
+
+/// Does a freeze that is due for a write have to resolve its address first?
+///
+/// Signature resolvers scan the whole module and code does not move while a
+/// process lives, so their address is kept for as long as that process is the
+/// target. A failed write drops `last`, which forces a new scan. Pointer and
+/// script addresses follow game state, so every other resolver refreshes.
+fn needs_resolve(
+    resolver: &Resolver,
+    last: Option<&ResolvedFreeze>,
+    pid: i32,
+    now: Instant,
+) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    if last.pid != pid {
+        return true;
+    }
+    !matches!(resolver, Resolver::Signature { .. })
+        && now.duration_since(last.resolved_at) >= ADDRESS_REFRESH
 }
 
 fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
@@ -199,17 +223,14 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
             if !due {
                 continue;
             }
-            let needs_resolve = resolved
-                .get(&id)
-                .is_none_or(|entry| now.duration_since(entry.resolved_at) >= ADDRESS_REFRESH);
-
-            if needs_resolve {
+            if needs_resolve(&res, resolved.get(&id), pid, now) {
                 match resolver::resolve(&res, &mem, &maps, &scripts) {
                     Ok(addr) => {
                         resolved.insert(
                             id.clone(),
                             ResolvedFreeze {
                                 addr,
+                                pid,
                                 resolved_at: now,
                             },
                         );
@@ -298,6 +319,83 @@ fn reinit_due(last_reinit: Option<Instant>, now: Instant) -> bool {
 }
 
 #[cfg(test)]
+mod needs_resolve_tests {
+    use super::*;
+
+    const PID: i32 = 1234;
+
+    fn resolver(json: serde_json::Value) -> Resolver {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn signature() -> Resolver {
+        resolver(serde_json::json!({
+            "type": "signature", "module": "game.exe", "pattern": "90 90"
+        }))
+    }
+
+    fn other_resolvers() -> [Resolver; 4] {
+        [
+            resolver(serde_json::json!({"type": "absolute", "address": "0x1000"})),
+            resolver(serde_json::json!({
+                "type": "module_offset", "module": "game.exe", "offset": "0x10"
+            })),
+            resolver(serde_json::json!({
+                "type": "pointer", "module": "game.exe", "offset": "0x10", "offsets": ["0x8"]
+            })),
+            resolver(serde_json::json!({"type": "script", "code": "return 1"})),
+        ]
+    }
+
+    fn resolved_at(resolved_at: Instant) -> ResolvedFreeze {
+        ResolvedFreeze {
+            addr: 0x1000,
+            pid: PID,
+            resolved_at,
+        }
+    }
+
+    #[test]
+    fn nothing_resolved_yet_always_resolves() {
+        let now = Instant::now();
+        assert!(needs_resolve(&signature(), None, PID, now));
+        for r in other_resolvers() {
+            assert!(needs_resolve(&r, None, PID, now), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn signature_keeps_its_address_however_old() {
+        let start = Instant::now();
+        let last = resolved_at(start);
+        for later in [Duration::ZERO, ADDRESS_REFRESH, Duration::from_secs(3600)] {
+            assert!(!needs_resolve(&signature(), Some(&last), PID, start + later));
+        }
+    }
+
+    #[test]
+    fn other_resolvers_refresh_on_the_existing_schedule() {
+        let start = Instant::now();
+        let last = resolved_at(start);
+        for r in other_resolvers() {
+            let early = start + ADDRESS_REFRESH - Duration::from_millis(1);
+            assert!(!needs_resolve(&r, Some(&last), PID, early), "{r:?}");
+            assert!(needs_resolve(&r, Some(&last), PID, start + ADDRESS_REFRESH), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_process_invalidates_every_address() {
+        let now = Instant::now();
+        let last = resolved_at(now);
+        assert!(needs_resolve(&signature(), Some(&last), PID + 1, now));
+        for r in other_resolvers() {
+            assert!(needs_resolve(&r, Some(&last), PID + 1, now), "{r:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod reinit_tests {
     use super::*;
 
@@ -364,5 +462,60 @@ mod live_tests {
     fn saves_nothing_unless_asked() {
         let mut value = Box::new(5i32);
         assert!(freeze_and_remove(&mut value, false).is_none());
+    }
+
+    /// Bytes for a signature to find, in this test binary's own `.data`, followed
+    /// by the frozen value. Only tests that scan for this signature touch it.
+    static mut SIGNED: [u8; 12] = [0x5A, 0xC3, 0x7E, 0x19, 0xD4, 0x62, 0xB8, 0x2F, 0, 0, 0, 0];
+
+    fn signed_value() -> *mut i32 {
+        std::ptr::addr_of_mut!(SIGNED).cast::<u8>().wrapping_add(8).cast()
+    }
+
+    /// Wait for the freeze to write `SIGNED`'s value after it is set to zero.
+    fn assert_rewritten_within(limit: Duration) {
+        unsafe { signed_value().write_unaligned(0) };
+        let deadline = Instant::now() + limit;
+        while unsafe { signed_value().read_unaligned() } != 999 {
+            assert!(Instant::now() < deadline, "freeze stopped writing the value");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn signature_freeze_keeps_its_address_after_the_signature_disappears() {
+        let exe = std::env::current_exe().unwrap();
+        let module = exe.file_name().unwrap().to_str().unwrap().to_string();
+        let manager = FreezeManager::new("test");
+        manager.set_script_engine(new_handle(ScriptEngine::new(
+            "test",
+            None,
+            Vec::new(),
+            Arc::new(StdMutex::new(TrainerSession::new())),
+        )));
+        manager.set_pid(std::process::id() as i32);
+        let resolver: Resolver = serde_json::from_value(serde_json::json!({
+            "type": "signature",
+            "module": module,
+            "pattern": "5A C3 7E 19 D4 62 B8 2F",
+            "offset": 8,
+        }))
+        .unwrap();
+        manager.add(
+            "cheat",
+            FreezeEntry {
+                resolver,
+                bytes: 999i32.to_ne_bytes().to_vec(),
+                interval_ms: 20,
+                restore_on_disable: false,
+            },
+        );
+        assert_rewritten_within(Duration::from_secs(5));
+
+        // A rescan would now fail, and a failed resolve stops the writes.
+        unsafe { std::ptr::addr_of_mut!(SIGNED).cast::<u8>().write_volatile(0) };
+        std::thread::sleep(ADDRESS_REFRESH + Duration::from_millis(300));
+        assert_rewritten_within(ADDRESS_REFRESH);
+        assert!(manager.remove("cheat"));
     }
 }
