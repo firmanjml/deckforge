@@ -1,0 +1,392 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/firmanjml/deckforge/master/docs/trainer.schema.json",
+  "title": "DeckForge trainer",
+  "description": "A DeckForge trainer.json file. Forge's loader remains the final check for rules a schema cannot express: the package directory matching steamAppId, unique cheat ids, requires naming a declared bootstrap component, script files existing, and patch expected and enabled having the same length.",
+  "type": "object",
+  "required": ["formatVersion", "game", "trainer"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Lets editors find this schema. Forge ignores it."
+    },
+    "formatVersion": {
+      "const": 1
+    },
+    "game": {
+      "type": "object",
+      "required": ["steamAppId", "name", "process"],
+      "additionalProperties": false,
+      "properties": {
+        "steamAppId": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Must match the package directory name."
+        },
+        "name": { "$ref": "#/$defs/text" },
+        "process": {
+          "$ref": "#/$defs/text",
+          "description": "The real Proton game executable, including .exe and correct case."
+        }
+      }
+    },
+    "trainer": {
+      "type": "object",
+      "required": ["id", "name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]*$"
+        },
+        "name": { "$ref": "#/$defs/text" },
+        "version": {
+          "$ref": "#/$defs/text",
+          "description": "Change this when publishing an update, because the store compares it to offer updates."
+        },
+        "author": { "type": "string" }
+      }
+    },
+    "scriptSetup": {
+      "type": "string",
+      "description": "Legacy inline Lua setup. Prefer scripts.setup files."
+    },
+    "scripts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "setup": {
+          "type": "array",
+          "description": "Lua files run in order when the shared VM boots.",
+          "items": { "$ref": "#/$defs/scriptPath" }
+        },
+        "bootstrap": {
+          "type": "array",
+          "description": "Auto Assembler components that cheats pull in through requires. A plain path takes its id from the file name.",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/scriptPath" },
+              {
+                "type": "object",
+                "required": ["id", "file"],
+                "additionalProperties": false,
+                "properties": {
+                  "id": { "$ref": "#/$defs/id" },
+                  "file": { "$ref": "#/$defs/scriptPath" }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "cheats": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/cheat" }
+    }
+  },
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "A stable, lowercase snake_case id."
+    },
+    "scriptPath": {
+      "type": "string",
+      "pattern": "^(?!/)(?!\\s*$)(?!(.*/)?\\.\\.(/|$))[^\\\\:]+$",
+      "description": "Relative to the package, using forward slashes, with no drive letters or '..'."
+    },
+    "hexValue": {
+      "description": "An offset or address: a string such as \"0x1A20\", or a non-negative integer.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^(0[xX][0-9a-fA-F]+|[0-9]+)$"
+        },
+        {
+          "type": "integer",
+          "minimum": 0
+        }
+      ]
+    },
+    "hexBytes": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{2}(\\s+[0-9A-Fa-f]{2})*$",
+      "description": "Space-separated hex bytes such as \"89 43 20\". Wildcards are not allowed here."
+    },
+    "valueType": {
+      "enum": [
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float32",
+        "float64"
+      ]
+    },
+    "cheat": {
+      "type": "object",
+      "required": ["id", "name", "control", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "name": { "$ref": "#/$defs/text" },
+        "control": {
+          "enum": ["toggle", "number", "action", "slider", "select"],
+          "description": "Cockpit renders toggle, number, and action. It does not render slider or select yet, so those cheats will not appear."
+        },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "requires": {
+          "type": "array",
+          "description": "Ids of scripts.bootstrap components this cheat needs.",
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "action": { "$ref": "#/$defs/action" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "control": { "const": "toggle" } }, "required": ["control"] },
+          "then": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "type": {
+                    "enum": ["patch", "freeze", "auto_assembler"],
+                    "description": "A toggle needs an action that can be turned on and off."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "control": { "enum": ["number", "slider", "select"] } },
+            "required": ["control"]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "type": {
+                    "const": "value",
+                    "description": "This control writes a value the player chooses, so it needs a value action."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "control": { "const": "action" } }, "required": ["control"] },
+          "then": {
+            "properties": {
+              "action": {
+                "required": ["value"],
+                "properties": {
+                  "type": {
+                    "enum": ["value", "freeze"],
+                    "description": "A button performs one write of the action's declared value."
+                  },
+                  "restoreOnDisable": {
+                    "const": false,
+                    "description": "Only a toggle can be turned off, so only a toggle can restore."
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "action": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "enum": ["patch", "value", "freeze", "auto_assembler"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "patch" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/patchAction" }
+        },
+        {
+          "if": { "properties": { "type": { "const": "value" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/valueAction" }
+        },
+        {
+          "if": { "properties": { "type": { "const": "freeze" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/freezeAction" }
+        },
+        {
+          "if": { "properties": { "type": { "const": "auto_assembler" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/autoAssemblerAction" }
+        }
+      ]
+    },
+    "patchAction": {
+      "type": "object",
+      "description": "Replace known bytes. Disabling restores the bytes saved when it was enabled.",
+      "required": ["type", "resolver", "expected", "enabled"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "patch" },
+        "resolver": { "$ref": "#/$defs/resolver" },
+        "offset": {
+          "$ref": "#/$defs/hexValue",
+          "description": "Added to the resolved address."
+        },
+        "expected": {
+          "$ref": "#/$defs/hexBytes",
+          "description": "The original bytes at the address. Must be the same length as enabled."
+        },
+        "enabled": {
+          "$ref": "#/$defs/hexBytes",
+          "description": "The bytes to write. Must be the same length as expected."
+        }
+      }
+    },
+    "valueAction": {
+      "type": "object",
+      "description": "Write a typed value once.",
+      "required": ["type", "valueType", "resolver"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "value" },
+        "valueType": { "$ref": "#/$defs/valueType" },
+        "resolver": { "$ref": "#/$defs/resolver" },
+        "value": {
+          "type": "number",
+          "description": "The value an action button writes. A number control takes it from the player instead."
+        }
+      }
+    },
+    "freezeAction": {
+      "type": "object",
+      "description": "Keep rewriting a typed value.",
+      "required": ["type", "valueType", "value", "resolver"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "freeze" },
+        "valueType": { "$ref": "#/$defs/valueType" },
+        "value": { "type": "number" },
+        "intervalMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Time between writes. Defaults to 100."
+        },
+        "resolver": { "$ref": "#/$defs/resolver" },
+        "restoreOnDisable": {
+          "type": "boolean",
+          "description": "Toggle only: put the previous value back when the cheat is turned off. Defaults to false."
+        }
+      }
+    },
+    "autoAssemblerAction": {
+      "type": "object",
+      "description": "Run a Cheat Engine-style script with [ENABLE] and [DISABLE] sections. Requires a toggle.",
+      "required": ["type", "file"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "auto_assembler" },
+        "file": { "$ref": "#/$defs/scriptPath" }
+      }
+    },
+    "resolver": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "enum": ["absolute", "module_offset", "pointer", "signature", "script"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "absolute" } }, "required": ["type"] },
+          "then": {
+            "description": "A fixed address, for development only: it will not survive a game restart.",
+            "required": ["address"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "absolute" },
+              "address": { "$ref": "#/$defs/hexValue" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "module_offset" } }, "required": ["type"] },
+          "then": {
+            "description": "The module's base address plus an offset.",
+            "required": ["module", "offset"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "module_offset" },
+              "module": { "$ref": "#/$defs/text" },
+              "offset": { "$ref": "#/$defs/hexValue" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "pointer" } }, "required": ["type"] },
+          "then": {
+            "description": "A pointer chain from the module's base plus offset. 64-bit targets only.",
+            "required": ["module", "offset"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "pointer" },
+              "module": { "$ref": "#/$defs/text" },
+              "offset": { "$ref": "#/$defs/hexValue" },
+              "offsets": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/hexValue" }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "signature" } }, "required": ["type"] },
+          "then": {
+            "description": "A byte pattern that must match exactly once in the module.",
+            "required": ["module", "pattern"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "signature" },
+              "module": { "$ref": "#/$defs/text" },
+              "pattern": {
+                "type": "string",
+                "pattern": "^([0-9A-Fa-f]{2}|\\?\\??)(\\s+([0-9A-Fa-f]{2}|\\?\\??))*$",
+                "description": "Space-separated hex bytes, with ?? as a wildcard."
+              },
+              "offset": { "$ref": "#/$defs/hexValue" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "script" } }, "required": ["type"] },
+          "then": {
+            "description": "A Lua chunk that returns the address, given as either code or file.",
+            "additionalProperties": false,
+            "oneOf": [{ "required": ["code"] }, { "required": ["file"] }],
+            "properties": {
+              "type": { "const": "script" },
+              "language": {
+                "type": "string",
+                "pattern": "^[Ll][Uu][Aa]$"
+              },
+              "code": { "type": "string" },
+              "file": { "$ref": "#/$defs/scriptPath" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

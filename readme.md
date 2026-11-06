@@ -279,6 +279,28 @@ A minimal trainer:
 
 All IDs should be stable, lowercase `snake_case`. Script paths must use forward slashes, be relative to the package, and may not escape it with `..`.
 
+### Validate with the JSON schema
+
+[`docs/trainer.schema.json`](docs/trainer.schema.json) describes `trainer.json`, so you can catch mistakes before starting a game. Add this line to get autocomplete and error highlighting in editors such as VS Code. Forge ignores it.
+
+```json
+"$schema": "https://raw.githubusercontent.com/firmanjml/deckforge/master/docs/trainer.schema.json"
+```
+
+To check a file from the command line, on Windows or Linux:
+
+```bash
+npx ajv-cli@5 validate --spec=draft2020 --strict=false -s docs/trainer.schema.json -d path/to/trainer.json
+```
+
+The schema is stricter than Forge in places, so it also reports:
+
+- Misspelled or unknown fields, which Forge silently ignores.
+- Control and action pairs that load but can never work, such as a `toggle` with a `value` action.
+- Bad addresses, offsets, and signature patterns that Forge only notices when the cheat is used.
+
+It cannot check everything. Only Forge can confirm that cheat IDs are unique, that `requires` names a declared component, that script files exist, that `expected` and `enabled` have the same length, and that the directory matches `game.steamAppId`. Run the loader check in [`docs/STORE.md`](docs/STORE.md) as well. Neither check proves that a cheat works in the game.
+
 ### Controls and actions
 
 Cockpit currently renders `toggle`, `number`, and `action`. The schema also accepts `slider` and `select`, but Cockpit does not render them yet.

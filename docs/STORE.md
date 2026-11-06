@@ -69,8 +69,10 @@ Use `trainer: add <game name> (<appid>)` for a new trainer PR title and
 
 ### Validate the package locally
 
-Build Forge, point it at the checkout's `trainers/` directory, and request the
-trainer by AppID. This exercises the real loader, JSON schema validation,
+First check the file against the schema, which finds misspelled fields and
+control and action pairs that can never work (see "Validate with the JSON schema"
+in the [readme](../readme.md)). Then build Forge, point it at the checkout's
+`trainers/` directory, and request the trainer by AppID. This exercises the real loader, JSON schema validation,
 script path jail, referenced-file checks, and Auto Assembler/Lua file loading
 without requiring a running game:
 
@@ -132,6 +134,7 @@ executables.
 
 ## Package validation results
 
+- [ ] `trainers/<appid>/trainer.json` validates against `docs/trainer.schema.json`.
 - [ ] `trainers/<appid>/trainer.json` parses and loads through Forge.
 - [ ] The package directory matches `game.steamAppId`.
 - [ ] All `.asm`/`.lua` paths are relative and resolve inside the package.
