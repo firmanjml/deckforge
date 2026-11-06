@@ -7,7 +7,7 @@
 //! follows the game state instead of going stale. All freezes stop when the
 //! game exits or the trainer resets.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -111,10 +111,10 @@ const MAPS_REFRESH: Duration = Duration::from_secs(1);
 /// Frozen addresses are refreshed periodically so dynamic game state can move
 /// without making expensive script resolvers run for every write tick.
 const ADDRESS_REFRESH: Duration = Duration::from_secs(1);
-/// After this many consecutive failures of one cheat, reset the script VM so
-/// script resolvers re-discover from scratch. A failure is often temporary (no
-/// player in a menu) and discovery can be expensive, so it is kept until then.
-const REINIT_FAILURES: u32 = 200;
+/// A failed cheat resets the script VM so script resolvers re-discover against
+/// the current game state, for example once a player exists. Discovery can be
+/// expensive and a failure can last a long time, so this is rate limited.
+const REINIT_COOLDOWN: Duration = Duration::from_secs(30);
 
 struct ResolvedFreeze {
     addr: usize,
@@ -126,7 +126,8 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
     let mut last_maps = Instant::now() - MAPS_REFRESH;
     let mut last_write: HashMap<String, Instant> = HashMap::new();
     let mut resolved: HashMap<String, ResolvedFreeze> = HashMap::new();
-    let mut failures: HashMap<String, u32> = HashMap::new();
+    let mut failing: HashSet<String> = HashSet::new();
+    let mut last_reinit: Option<Instant> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -161,7 +162,7 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
         }
 
         resolved.retain(|id, _| items.iter().any(|(item_id, _, _, _)| item_id == id));
-        failures.retain(|id, _| items.iter().any(|(item_id, _, _, _)| item_id == id));
+        failing.retain(|id| items.iter().any(|(item_id, _, _, _)| item_id == id));
 
         if last_maps.elapsed() >= MAPS_REFRESH {
             if let Ok(m) = crate::process::modules::read_modules(pid) {
@@ -196,13 +197,13 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
                     }
                     Err(e) => {
                         resolved.remove(&id);
-                        let count = record_failure(&mut failures, &id);
-                        if should_log_failure(count) {
+                        if failing.insert(id.clone()) {
                             eprintln!(
                                 "[forge] freeze '{id}': resolve failed ({e}); will keep retrying"
                             );
                         }
-                        if should_reinit(count) {
+                        if reinit_due(last_reinit, now) {
+                            last_reinit = Some(now);
                             scripts.lock().unwrap().reset();
                         }
                         last_write.insert(id, now + ADDRESS_REFRESH);
@@ -216,16 +217,16 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
             };
             match mem.write_bytes(addr, &bytes) {
                 Ok(()) => {
-                    failures.remove(&id);
+                    failing.remove(&id);
                     last_write.insert(id, now);
                 }
                 Err(e) => {
                     resolved.remove(&id);
-                    let count = record_failure(&mut failures, &id);
-                    if should_log_failure(count) {
+                    if failing.insert(id.clone()) {
                         eprintln!("[forge] freeze '{id}': write failed ({e}); will re-resolve");
                     }
-                    if should_reinit(count) {
+                    if reinit_due(last_reinit, now) {
+                        last_reinit = Some(now);
                         scripts.lock().unwrap().reset();
                     }
                     last_write.insert(id, now + ADDRESS_REFRESH);
@@ -237,36 +238,19 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
     }
 }
 
-fn record_failure(failures: &mut HashMap<String, u32>, id: &str) -> u32 {
-    let count = failures.entry(id.to_string()).or_insert(0);
-    *count += 1;
-    *count
-}
-
-fn should_log_failure(count: u32) -> bool {
-    count == 1 || should_reinit(count)
-}
-
-fn should_reinit(count: u32) -> bool {
-    count % REINIT_FAILURES == 0
+fn reinit_due(last_reinit: Option<Instant>, now: Instant) -> bool {
+    last_reinit.is_none_or(|last| now.duration_since(last) >= REINIT_COOLDOWN)
 }
 
 #[cfg(test)]
-mod failure_tests {
+mod reinit_tests {
     use super::*;
 
     #[test]
-    fn first_failure_keeps_script_state() {
-        assert!(should_log_failure(1));
-        assert!(!should_reinit(1));
-        assert!(should_reinit(REINIT_FAILURES));
-    }
-
-    #[test]
-    fn failures_are_counted_per_cheat() {
-        let mut failures = HashMap::new();
-        assert_eq!(record_failure(&mut failures, "a"), 1);
-        assert_eq!(record_failure(&mut failures, "a"), 2);
-        assert_eq!(record_failure(&mut failures, "b"), 1);
+    fn first_failure_reinitializes_then_waits_for_the_cooldown() {
+        let start = Instant::now();
+        assert!(reinit_due(None, start));
+        assert!(!reinit_due(Some(start), start + Duration::from_secs(29)));
+        assert!(reinit_due(Some(start), start + REINIT_COOLDOWN));
     }
 }
