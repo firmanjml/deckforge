@@ -8,6 +8,76 @@ DeckForge does not launch Windows trainer executables. Its Rust engine reads and
 
 https://github.com/user-attachments/assets/accb76a1-08ef-4d31-8524-7e989593932b
 
+## Install
+
+### Requirements
+
+- Steam Deck or another x86_64 device running SteamOS (or a similar Linux distro)
+- [Decky Loader](https://decky.xyz) installed
+- A sudo password. If you have never set one on your Deck, run `passwd` first.
+
+### Quick install (recommended)
+
+Run this on the Deck itself or over SSH from your PC.
+
+**On your Deck:**
+
+1. Switch to Desktop Mode.
+2. Open Konsole.
+3. Run:
+
+```bash
+curl -L https://github.com/firmanjml/deckforge/raw/master/install.sh | sh
+```
+
+**Over SSH from your PC:**
+
+```bash
+ssh deck@<your-deck-ip>
+curl -L https://github.com/firmanjml/deckforge/raw/master/install.sh | sh
+```
+
+The installer downloads the latest release, installs it to `~/homebrew/plugins/DeckForge`, and restarts Decky Loader. It asks for your sudo password, and asks before replacing an existing installation.
+
+### Update
+
+Run the same command again and answer `y`. Your installed trainers are stored separately in `~/homebrew/data/DeckForge/trainers`, so they are kept.
+
+To skip the question, for example in a script:
+
+```bash
+curl -L https://github.com/firmanjml/deckforge/raw/master/install.sh | sh -s -- --yes
+```
+
+### Manual install
+
+1. Download `deckforge.zip` from the [latest release](https://github.com/firmanjml/deckforge/releases/latest).
+2. Extract and install it:
+
+```bash
+sudo mkdir -p ~/homebrew/plugins/DeckForge
+sudo unzip -o deckforge.zip -d ~/homebrew/plugins/DeckForge
+sudo chown -R "$(id -un):$(id -gn)" ~/homebrew/plugins/DeckForge
+chmod 755 ~/homebrew/plugins/DeckForge/bin/deckforge-engine
+sudo systemctl restart plugin_loader
+```
+
+### Uninstall
+
+```bash
+sudo rm -rf ~/homebrew/plugins/DeckForge
+sudo systemctl restart plugin_loader
+```
+
+To remove your installed trainers as well, also delete `~/homebrew/data/DeckForge`.
+
+### Use it
+
+1. Start a game in Gaming Mode.
+2. Press the **...** button to open the Quick Access menu, then select the **Decky** plug icon and **DeckForge**.
+3. If the game has no trainer yet, select the store icon next to the DeckForge title, open the **Browse** tab, and install one.
+4. Use the toggles, number fields, and buttons to control the cheats.
+
 ## How it works
 
 ```text
@@ -87,6 +157,9 @@ deckforge/
 ├── fixtures/trainers/       development-only trainer packages
 ├── docs/                    deeper architecture/development/store notes
 ├── bin/                     staged deckforge-engine binary
+├── install.sh               installer that users run on their device
+├── release.sh               builds and packages deckforge.zip
+├── .github/workflows/       publishes a release for each version tag
 ├── main.py                  Decky entry shim to relay.main.Plugin
 ├── plugin.json
 └── llm.txt                  CE-table porting reference for coding agents
@@ -122,6 +195,22 @@ cargo test --manifest-path forge/Cargo.toml
 To deploy manually, stage the Linux release binary as `bin/deckforge-engine`
 and copy `dist/`, `main.py`, `relay/`, `plugin.json`, and `bin/` into the
 Decky plugin directory. The engine binary must be executable.
+
+### Publish a release
+
+Pushing a version tag makes GitHub Actions run the Forge tests, build `deckforge.zip`, and publish it as the release that `install.sh` downloads. The build runs on GitHub, so you can publish from Windows.
+
+1. Set the new version in `package.json` and commit it.
+2. Tag that commit and push both:
+
+```bash
+git tag v0.1.0
+git push origin master v0.1.0
+```
+
+The tag must match the `package.json` version, or the build stops. To test the packaging locally on Linux, run `./release.sh <version>`.
+
+To test an unreleased zip with the installer, set `DECKFORGE_ZIP_URL` to its URL.
 
 Useful environment variables:
 

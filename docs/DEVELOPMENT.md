@@ -92,6 +92,11 @@ decimal numbers.
    automatically. Set `DECKFORGE_TRAINER_DIR` to use a different directory, such
    as a local `fixtures/trainers`.
 
+## Publishing a release
+
+Users install from the zip attached to the latest GitHub release. See
+"Publish a release" in the [readme](../readme.md) for the steps.
+
 ## What requires a Steam Deck
 
 These cannot be verified off-device and are **not** claimed as verified here:

@@ -6,7 +6,7 @@ Forge owns all of this (it is the source of truth for trainer state); Relay
 only forwards requests; Cockpit only renders.
 
 ```
-Cockpit  StorePanel.tsx
+Cockpit  StorePage.tsx
    │  repo_list / repo_install / install_status / repo_uninstall / repo_list_installed
    ▼
 Relay    (5 thin forwarders)
@@ -299,8 +299,8 @@ cargo test --manifest-path forge/Cargo.toml -- store:: trainer::loader::
 ### End-to-end test
 
 1. Create `trainers/<appid>/trainer.json` in the `deckforge-trainers` repo.
-2. Launch a game with that AppID, open DeckForge → **Trainer Store** →
-   **Browse Store**.
+2. Launch a game with that AppID, open DeckForge, select the store icon next to
+   the title, and open the **Browse** tab.
 3. Click **Install**; the progress bar advances; on `done` the trainer appears
    in the main view.
 4. **Remove** uninstalls it.
