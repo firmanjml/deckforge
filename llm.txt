@@ -253,6 +253,11 @@ FREEZE
 An action control may use a freeze action as a one-shot write. A number control
 cannot set a freeze action. A value action is stateless and cannot be toggled.
 
+Turning a toggle freeze off leaves the frozen value in memory. Add
+"restoreOnDisable": true when the previous value should come back, such as a
+damage value. Leave it out for changes to keep, such as currency. It is only
+valid on toggle controls.
+
 
 RESOLVER TEMPLATES
 ------------------

@@ -240,6 +240,11 @@ pub enum CheatAction {
         #[serde(rename = "intervalMs", default)]
         interval_ms: Option<u64>,
         resolver: Resolver,
+        /// Toggle cheats only: put the value from before the freeze back when
+        /// the cheat is turned off. Off by default, because undoing a change
+        /// like added currency is usually not wanted.
+        #[serde(rename = "restoreOnDisable", default)]
+        restore_on_disable: bool,
     },
     /// Cheat Engine–style Auto Assembler script file (toggle cheats only).
     /// The file normally contains `[ENABLE]` and `[DISABLE]` sections;

@@ -301,6 +301,8 @@ An `action` button can use the same action with a declared value:
 
 All active freezes share one central manager. The resolver is run again during freeze ticks, which allows pointer- and Lua-resolved addresses to follow game state changes. Intervals are clamped to a practical minimum internally.
 
+Turning a freeze off normally leaves the frozen value in memory. Add `"restoreOnDisable": true` to a `toggle` freeze when the old value should come back, such as a damage multiplier. Leave it off for changes the player wants to keep, such as currency. If the game has moved the value by then, Forge skips the restore instead of writing to memory that may now hold something else.
+
 ### Address resolvers
 
 Module offset:

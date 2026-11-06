@@ -79,7 +79,17 @@ fn validate_cheat(cheat: &CheatDefinition) -> EngineResult<()> {
                 )));
             }
         }
-        CheatAction::Value { .. } | CheatAction::Freeze { .. } => {}
+        CheatAction::Value { .. } => {}
+        CheatAction::Freeze {
+            restore_on_disable, ..
+        } => {
+            if *restore_on_disable && cheat.control != Control::Toggle {
+                return Err(EngineError::InvalidTrainer(format!(
+                    "cheat '{}': restoreOnDisable requires control \"toggle\"",
+                    cheat.id
+                )));
+            }
+        }
         CheatAction::AutoAssembler { .. } => {
             // Auto Assembler scripts have enable/disable semantics; only the
             // toggle control maps onto that.
@@ -178,6 +188,35 @@ mod tests {
             validate(&def, 1),
             Err(EngineError::InvalidTrainer(_))
         ));
+    }
+
+    fn freeze_trainer_json(control: &str, restore: bool) -> String {
+        format!(
+            r#"{{
+          "formatVersion": 1,
+          "game": {{ "steamAppId": 1, "name": "G", "process": "g.exe" }},
+          "trainer": {{ "id": "t", "name": "T", "version": "1" }},
+          "cheats": [{{
+            "id": "c", "name": "C", "control": "{control}",
+            "action": {{ "type": "freeze", "valueType": "float64", "value": 1.0,
+              "restoreOnDisable": {restore},
+              "resolver": {{ "type": "module_offset", "module": "g.exe", "offset": "0x1000" }} }}
+          }}]
+        }}"#
+        )
+    }
+
+    #[test]
+    fn restore_on_disable_requires_a_toggle() {
+        let toggle: TrainerDefinition =
+            serde_json::from_str(&freeze_trainer_json("toggle", true)).unwrap();
+        assert!(validate(&toggle, 1).is_ok());
+        let button: TrainerDefinition =
+            serde_json::from_str(&freeze_trainer_json("action", true)).unwrap();
+        assert!(validate(&button, 1).is_err());
+        let plain_button: TrainerDefinition =
+            serde_json::from_str(&freeze_trainer_json("action", false)).unwrap();
+        assert!(validate(&plain_button, 1).is_ok());
     }
 
     #[test]

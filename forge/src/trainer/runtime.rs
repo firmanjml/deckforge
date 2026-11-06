@@ -157,6 +157,7 @@ impl TrainerRuntime {
                 value,
                 interval_ms,
                 resolver,
+                restore_on_disable,
             } => {
                 if self.freezes.contains(cheat_id) {
                     return Err(EngineError::CheatAlreadyEnabled(cheat_id.to_string()));
@@ -172,6 +173,7 @@ impl TrainerRuntime {
                         resolver,
                         bytes,
                         interval_ms: interval_ms.unwrap_or(100),
+                        restore_on_disable,
                     },
                 );
                 Ok(())
@@ -206,6 +208,7 @@ impl TrainerRuntime {
     ) -> EngineResult<()> {
         let i = self.index_of(cheat_id)?;
         let action = self.def.cheats[i].action.clone();
+        let mut restored = Ok(());
         let result = match action {
             CheatAction::Patch { .. } => {
                 let runtime = self
@@ -214,8 +217,11 @@ impl TrainerRuntime {
                     .ok_or_else(|| EngineError::CheatNotEnabled(cheat_id.to_string()))?;
                 runtime.disable(mem, cheat_id)
             }
-            CheatAction::Freeze { .. } => {
+            CheatAction::Freeze { ref resolver, .. } => {
                 if self.freezes.remove(cheat_id) {
+                    // Before the release below: the resolver may need a
+                    // symbol that this cheat's dependency provides.
+                    restored = self.restore_frozen(cheat_id, resolver, mem, maps);
                     Ok(())
                 } else {
                     Err(EngineError::CheatNotEnabled(cheat_id.to_string()))
@@ -241,9 +247,35 @@ impl TrainerRuntime {
                 // Release this cheat's dependency references; components with
                 // no remaining dependents are torn down.
                 self.release_dependencies(cheat_id, &[], mem, maps);
-                Ok(())
+                restored
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Write back the value saved when a `restoreOnDisable` freeze started. The
+    /// saved address must still be where the resolver points: otherwise the
+    /// game has moved the value and that memory may now hold something else.
+    fn restore_frozen(
+        &self,
+        cheat_id: &str,
+        resolver: &resolver::Resolver,
+        mem: &MemoryAccess,
+        maps: &[MemoryRegion],
+    ) -> EngineResult<()> {
+        let Some(saved) = self.freezes.take_saved(cheat_id) else {
+            return Ok(());
+        };
+        match resolver::resolve(resolver, mem, maps, &self.scripts) {
+            Ok(addr) if addr == saved.addr => mem.write_bytes(addr, &saved.bytes),
+            Ok(_) => {
+                eprintln!("[forge] freeze '{cheat_id}': value moved; not restoring");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[forge] freeze '{cheat_id}': not restoring ({e})");
+                Ok(())
+            }
         }
     }
 
@@ -458,6 +490,23 @@ impl TrainerRuntime {
     /// unload): run `[DISABLE]` for every active Auto Assembler cheat and
     /// every initialized bootstrap component, then clear session state.
     pub fn shutdown(&mut self, mem: &MemoryAccess, maps: &[MemoryRegion]) {
+        // First, because a freeze resolver may need a symbol from a component.
+        let freezes: Vec<(String, resolver::Resolver)> = self
+            .def
+            .cheats
+            .iter()
+            .filter_map(|c| match &c.action {
+                CheatAction::Freeze { resolver, .. } => Some((c.id.clone(), resolver.clone())),
+                _ => None,
+            })
+            .collect();
+        for (id, resolver) in &freezes {
+            if self.freezes.remove(id) {
+                if let Err(e) = self.restore_frozen(id, resolver, mem, maps) {
+                    eprintln!("[forge] shutdown: restore '{id}' failed: {e}");
+                }
+            }
+        }
         // Clone the module name so `live` doesn't borrow `self`.
         let module = self.def.game.process.clone();
         let live = LiveMemory::new(mem, maps, &module);

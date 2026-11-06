@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::cheats::script::ScriptEngineHandle;
+use crate::error::{EngineError, EngineResult};
 use crate::memory::{MemoryAccess, MemoryRegion};
 use crate::process::procfs::is_alive;
 use crate::resolver::{self, Resolver};
@@ -23,10 +24,19 @@ pub struct FreezeEntry {
     pub resolver: Resolver,
     pub bytes: Vec<u8>,
     pub interval_ms: u64,
+    /// Save the value found at the address before freezing it.
+    pub restore_on_disable: bool,
+}
+
+/// A value from before a freeze overwrote it.
+pub struct SavedValue {
+    pub addr: usize,
+    pub bytes: Vec<u8>,
 }
 
 struct Shared {
     entries: HashMap<String, FreezeEntry>,
+    saved: HashMap<String, SavedValue>,
     pid: Option<i32>,
     module: String,
     scripts: Option<ScriptEngineHandle>,
@@ -42,6 +52,7 @@ impl FreezeManager {
     pub fn new(module: &str) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             entries: HashMap::new(),
+            saved: HashMap::new(),
             pid: None,
             module: module.to_string(),
             scripts: None,
@@ -71,15 +82,20 @@ impl FreezeManager {
     }
 
     pub fn add(&self, id: &str, entry: FreezeEntry) {
-        self.shared
-            .lock()
-            .unwrap()
-            .entries
-            .insert(id.to_string(), entry);
+        let mut shared = self.shared.lock().unwrap();
+        shared.saved.remove(id);
+        shared.entries.insert(id.to_string(), entry);
     }
 
     pub fn remove(&self, id: &str) -> bool {
         self.shared.lock().unwrap().entries.remove(id).is_some()
+    }
+
+    /// The value saved for a removed entry. No more can be saved after `remove`,
+    /// and the loop checks for the entry under the same lock as its writes, so a
+    /// restore cannot be overwritten by a write already in progress.
+    pub fn take_saved(&self, id: &str) -> Option<SavedValue> {
+        self.shared.lock().unwrap().saved.remove(id)
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -87,7 +103,9 @@ impl FreezeManager {
     }
 
     pub fn clear(&self) {
-        self.shared.lock().unwrap().entries.clear();
+        let mut shared = self.shared.lock().unwrap();
+        shared.entries.clear();
+        shared.saved.clear();
     }
 
     fn stop_thread(&mut self) {
@@ -136,7 +154,7 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
 
         let (pid, scripts, items) = {
             let s = shared.lock().unwrap();
-            let items: Vec<(String, Resolver, Vec<u8>, u64)> = s
+            let items: Vec<(String, Resolver, Vec<u8>, u64, bool)> = s
                 .entries
                 .iter()
                 .map(|(id, e)| {
@@ -145,6 +163,7 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
                         e.resolver.clone(),
                         e.bytes.clone(),
                         e.interval_ms,
+                        e.restore_on_disable,
                     )
                 })
                 .collect();
@@ -161,8 +180,8 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
             continue;
         }
 
-        resolved.retain(|id, _| items.iter().any(|(item_id, _, _, _)| item_id == id));
-        failing.retain(|id| items.iter().any(|(item_id, _, _, _)| item_id == id));
+        resolved.retain(|id, _| items.iter().any(|(item_id, ..)| item_id == id));
+        failing.retain(|id| items.iter().any(|(item_id, ..)| item_id == id));
 
         if last_maps.elapsed() >= MAPS_REFRESH {
             if let Ok(m) = crate::process::modules::read_modules(pid) {
@@ -173,7 +192,7 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
 
         let mem = MemoryAccess::new(pid);
         let now = Instant::now();
-        for (id, res, bytes, interval_ms) in items {
+        for (id, res, bytes, interval_ms, restore) in items {
             let due = last_write
                 .get(&id)
                 .is_none_or(|t| now.duration_since(*t).as_millis() as u64 >= interval_ms.max(20));
@@ -215,7 +234,14 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
             let Some(addr) = resolved.get(&id).map(|entry| entry.addr) else {
                 continue;
             };
-            match mem.write_bytes(addr, &bytes) {
+            let written = {
+                let mut s = shared.lock().unwrap();
+                if !s.entries.contains_key(&id) {
+                    continue; // disabled since this pass began
+                }
+                write_frozen(&mut s.saved, &mem, &id, addr, &bytes, restore)
+            };
+            match written {
                 Ok(()) => {
                     failing.remove(&id);
                     last_write.insert(id, now);
@@ -238,6 +264,35 @@ fn freeze_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
     }
 }
 
+/// Write a frozen value, first saving what it replaces when the cheat restores
+/// on disable. A new address is saved again, because the old value did not move
+/// with the game's data.
+fn write_frozen(
+    saved: &mut HashMap<String, SavedValue>,
+    mem: &MemoryAccess,
+    id: &str,
+    addr: usize,
+    bytes: &[u8],
+    restore: bool,
+) -> EngineResult<()> {
+    if restore && saved.get(id).is_none_or(|value| value.addr != addr) {
+        let original = mem.read_bytes(addr, bytes.len())?;
+        if original.len() != bytes.len() {
+            return Err(EngineError::MemoryReadFailed(format!(
+                "short read of frozen value at 0x{addr:x}"
+            )));
+        }
+        saved.insert(
+            id.to_string(),
+            SavedValue {
+                addr,
+                bytes: original,
+            },
+        );
+    }
+    mem.write_bytes(addr, bytes)
+}
+
 fn reinit_due(last_reinit: Option<Instant>, now: Instant) -> bool {
     last_reinit.is_none_or(|last| now.duration_since(last) >= REINIT_COOLDOWN)
 }
@@ -252,5 +307,62 @@ mod reinit_tests {
         assert!(reinit_due(None, start));
         assert!(!reinit_due(Some(start), start + Duration::from_secs(29)));
         assert!(reinit_due(Some(start), start + REINIT_COOLDOWN));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod live_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    use crate::cheats::script::{new_handle, ScriptEngine};
+    use crate::trainer::session::TrainerSession;
+
+    /// Run a real freeze against this test process until it takes effect, then
+    /// remove it and return what was saved.
+    fn freeze_and_remove(value: &mut i32, restore: bool) -> Option<SavedValue> {
+        let addr = value as *mut i32 as usize;
+        let manager = FreezeManager::new("test");
+        manager.set_script_engine(new_handle(ScriptEngine::new(
+            "test",
+            None,
+            Vec::new(),
+            Arc::new(StdMutex::new(TrainerSession::new())),
+        )));
+        manager.set_pid(std::process::id() as i32);
+        let resolver: Resolver =
+            serde_json::from_value(serde_json::json!({"type": "absolute", "address": addr}))
+                .unwrap();
+        manager.add(
+            "cheat",
+            FreezeEntry {
+                resolver,
+                bytes: 999i32.to_ne_bytes().to_vec(),
+                interval_ms: 20,
+                restore_on_disable: restore,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { std::ptr::read_volatile(value) } != 999 {
+            assert!(Instant::now() < deadline, "freeze never wrote the value");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(manager.remove("cheat"));
+        manager.take_saved("cheat")
+    }
+
+    #[test]
+    fn saves_the_value_from_before_the_freeze() {
+        let mut value = Box::new(5i32);
+        let addr = &*value as *const i32 as usize;
+        let saved = freeze_and_remove(&mut value, true).expect("saved value");
+        assert_eq!(saved.addr, addr);
+        assert_eq!(saved.bytes, 5i32.to_ne_bytes());
+    }
+
+    #[test]
+    fn saves_nothing_unless_asked() {
+        let mut value = Box::new(5i32);
+        assert!(freeze_and_remove(&mut value, false).is_none());
     }
 }
