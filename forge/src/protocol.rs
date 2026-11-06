@@ -66,16 +66,24 @@ pub enum Command {
         cheat_id: String,
     },
     ReloadTrainer,
+    /// Start a scan. Without `value`, snapshots memory for an unknown value.
     ScanValue {
-        value: serde_json::Value,
+        #[serde(default)]
+        value: Option<serde_json::Value>,
         width: usize,
         #[serde(default)]
         float: bool,
-    },
-    ScanFilter {
-        value: serde_json::Value,
         #[serde(default)]
-        float: bool,
+        tolerance: Option<f64>,
+    },
+    /// Narrow a scan. `value` and `tolerance` apply to the `exact` mode.
+    ScanFilter {
+        #[serde(default)]
+        value: Option<serde_json::Value>,
+        #[serde(default)]
+        mode: crate::scanner::ScanMode,
+        #[serde(default)]
+        tolerance: Option<f64>,
     },
     ScanCount,
     ScanResults {

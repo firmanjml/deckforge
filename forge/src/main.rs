@@ -236,49 +236,31 @@ fn dispatch(state: &mut EngineState, cmd: &Command) -> EngineResult<serde_json::
             value,
             width,
             float,
+            tolerance,
         } => {
             state.ensure_alive()?;
+            state.refresh_maps();
             let mem = state.memory()?;
             let maps = state.maps_slice()?.to_vec();
-            let v = if *float {
-                value
-                    .as_f64()
-                    .ok_or_else(|| EngineError::InvalidRequest("expected number".into()))?
-            } else {
-                value
-                    .as_i64()
-                    .ok_or_else(|| EngineError::InvalidRequest("expected integer".into()))?
-                    as f64
-            };
-            let results = crate::scanner::first_scan(&mem, &maps, v, *width, *float)?;
-            state.scan.width = *width;
-            state.scan.results = results;
+            let format = crate::scanner::ValueFormat::new(*width, *float)?;
+            state
+                .scan
+                .start(&mem, &maps, format, value.as_ref(), *tolerance)?;
             Ok(val(ScanCountData {
                 count: state.scan.count(),
             }))
         }
 
-        Command::ScanFilter { value, float } => {
+        Command::ScanFilter {
+            value,
+            mode,
+            tolerance,
+        } => {
             state.ensure_alive()?;
-            if state.scan.results.is_empty() {
-                return Err(EngineError::InvalidRequest(
-                    "no previous scan to filter; run scan_value first".into(),
-                ));
-            }
             let mem = state.memory()?;
-            let v = if *float {
-                value
-                    .as_f64()
-                    .ok_or_else(|| EngineError::InvalidRequest("expected number".into()))?
-            } else {
-                value
-                    .as_i64()
-                    .ok_or_else(|| EngineError::InvalidRequest("expected integer".into()))?
-                    as f64
-            };
-            let results =
-                crate::scanner::next_scan(&mem, &state.scan.results, v, state.scan.width, *float)?;
-            state.scan.results = results;
+            state
+                .scan
+                .filter(&mem, *mode, value.as_ref(), *tolerance)?;
             Ok(val(ScanCountData {
                 count: state.scan.count(),
             }))
