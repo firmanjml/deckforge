@@ -1,4 +1,4 @@
-//! Address resolvers: absolute, module_offset, pointer, signature, scan, script.
+//! Address resolvers: absolute, module_offset, pointer, signature, script.
 //!
 //! A [`Resolver`] is deserialized from trainer JSON and resolved against the
 //! attached process's memory + maps. Resolution never continues through invalid
@@ -80,10 +80,6 @@ pub enum Resolver {
         #[serde(default)]
         offset: Option<HexValue>,
     },
-    Scan {
-        #[serde(rename = "valueType")]
-        value_type: String,
-    },
     /// Lua resolver. Either inline `code` or a `file` inside the trainer
     /// package (relative path, jailed — no absolute paths, no `..`). The chunk
     /// runs in the trainer's shared sandboxed Lua VM (see
@@ -131,9 +127,6 @@ pub fn resolve(
             let off = offset.as_ref().map(|h| h.parse()).transpose()?;
             signature::resolve(mem, maps, module, pattern, off)
         }
-        Resolver::Scan { .. } => Err(EngineError::InvalidRequest(
-            "scan resolver must be resolved via scan_resolve commands, not directly".into(),
-        )),
         Resolver::Script { code, file, .. } => {
             // The loader inlines `file` contents into `code` at load time, so
             // by the time we resolve, `code` is always populated.

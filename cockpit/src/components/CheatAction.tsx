@@ -1,5 +1,4 @@
 // Action control: a button that triggers a value write (e.g. "Set Currency 99999").
-// For auto-scan cheats, pressing the button finds and writes automatically.
 
 import { ButtonItem, PanelSectionRow } from "@decky/ui";
 import type { CheatInfo } from "../lib/types";

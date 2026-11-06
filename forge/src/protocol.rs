@@ -104,24 +104,6 @@ pub enum Command {
         address: usize,
         size: usize,
     },
-    ScanResolveStart {
-        #[serde(rename = "cheatId")]
-        cheat_id: String,
-        value: serde_json::Value,
-    },
-    ScanResolveFilter {
-        #[serde(rename = "cheatId")]
-        cheat_id: String,
-        value: serde_json::Value,
-    },
-    ScanResolveCount {
-        #[serde(rename = "cheatId")]
-        cheat_id: String,
-    },
-    ScanResolveDone {
-        #[serde(rename = "cheatId")]
-        cheat_id: String,
-    },
     /// Read-only cheat validation: resolve the cheat's address and read its
     /// current value. Never writes memory.
     ResolveCheat {
@@ -364,18 +346,6 @@ pub struct ScanStringData {
 pub struct ReadBytesData {
     pub address: usize,
     pub bytes: Vec<u8>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ScanResolveCountData {
-    pub count: usize,
-    pub resolved: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ScanResolveDoneData {
-    pub address: usize,
-    pub current_value: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ use protocol::{
     CatalogData, CatalogItemData, CheatResultData, Command, GameData, InstalledListData,
     InstalledTrainerData, JobIdData, JobStatusData, PingData, PointerScanData, ReadBytesData,
     ReadValueData, ReloadTrainerData, Request, ResolveCheatData, Response, ScanClassifyData,
-    ScanCountData, ScanResolveCountData, ScanResolveDoneData, ScanResultsData, ScanStringData,
+    ScanCountData, ScanResultsData, ScanStringData,
     ShutdownData, TriggerCheatData, UninstallData, ValueResultSetData, WriteValueData,
 };
 use state::EngineState;
@@ -448,46 +448,6 @@ fn dispatch(state: &mut EngineState, cmd: &Command) -> EngineResult<serde_json::
             Ok(val(ReadBytesData {
                 address: *address,
                 bytes,
-            }))
-        }
-
-        Command::ScanResolveStart { cheat_id, value } => {
-            state.ensure_alive()?;
-            let mem = state.memory()?;
-            let maps = state.maps_slice()?.to_vec();
-            let t = state.trainer.as_mut().ok_or(EngineError::TrainerNotFound)?;
-            let count = t.scan_resolve_start(cheat_id, value, &mem, &maps)?;
-            Ok(val(ScanResolveCountData {
-                count,
-                resolved: false,
-            }))
-        }
-
-        Command::ScanResolveFilter { cheat_id, value } => {
-            state.ensure_alive()?;
-            let mem = state.memory()?;
-            let t = state.trainer.as_mut().ok_or(EngineError::TrainerNotFound)?;
-            let count = t.scan_resolve_filter(cheat_id, value, &mem)?;
-            Ok(val(ScanResolveCountData {
-                count,
-                resolved: false,
-            }))
-        }
-
-        Command::ScanResolveCount { cheat_id } => {
-            let t = state.trainer.as_ref().ok_or(EngineError::TrainerNotFound)?;
-            let (count, resolved) = t.scan_resolve_count(cheat_id)?;
-            Ok(val(ScanResolveCountData { count, resolved }))
-        }
-
-        Command::ScanResolveDone { cheat_id } => {
-            state.ensure_alive()?;
-            let mem = state.memory()?;
-            let t = state.trainer.as_mut().ok_or(EngineError::TrainerNotFound)?;
-            let (addr, current) = t.scan_resolve_done(cheat_id, &mem)?;
-            Ok(val(ScanResolveDoneData {
-                address: addr,
-                current_value: current,
             }))
         }
 

@@ -13,23 +13,14 @@ use crate::cheats::patch::PatchRuntime;
 use crate::error::{EngineError, EngineResult};
 use crate::memory::{LiveMemory, MemoryAccess, MemoryOps, MemoryRegion};
 use crate::resolver;
-use crate::scanner;
 use crate::trainer::components::AaRunner;
 use crate::trainer::definition::{CheatAction, CheatDefinition, TrainerDefinition};
 use crate::trainer::session::TrainerSession;
-
-pub struct CheatScanState {
-    pub results: Vec<usize>,
-    pub width: usize,
-    pub is_float: bool,
-    pub resolved_address: Option<usize>,
-}
 
 pub struct TrainerRuntime {
     pub def: TrainerDefinition,
     pub patches: HashMap<String, PatchRuntime>,
     pub last_errors: HashMap<String, String>,
-    pub scans: HashMap<String, CheatScanState>,
     /// Shared sandboxed Lua engine for `"type": "script"` resolvers.
     pub scripts: crate::cheats::script::ScriptEngineHandle,
     /// Central freeze scheduler (infinite health/ammo style cheats).
@@ -44,23 +35,9 @@ pub struct TrainerRuntime {
 impl TrainerRuntime {
     pub fn new(def: TrainerDefinition) -> Self {
         let mut patches = HashMap::new();
-        let mut scans = HashMap::new();
         for cheat in &def.cheats {
             if matches!(cheat.action, CheatAction::Patch { .. }) {
                 patches.insert(cheat.id.clone(), PatchRuntime::default());
-            }
-            if let CheatAction::Value { resolver, .. } = &cheat.action {
-                if matches!(resolver, resolver::Resolver::Scan { .. }) {
-                    scans.insert(
-                        cheat.id.clone(),
-                        CheatScanState {
-                            results: Vec::new(),
-                            width: 8,
-                            is_float: true,
-                            resolved_address: None,
-                        },
-                    );
-                }
             }
         }
         let session = Arc::new(Mutex::new(TrainerSession::new()));
@@ -76,7 +53,6 @@ impl TrainerRuntime {
             def,
             patches,
             last_errors: HashMap::new(),
-            scans,
             scripts,
             freezes,
             session,
@@ -377,19 +353,7 @@ impl TrainerRuntime {
                 // initialize them on demand (no reference is held — value
                 // cheats are stateless).
                 self.ensure_dependencies_now(cheat_id, mem, maps)?;
-                let addr = match &resolver {
-                    resolver::Resolver::Scan { .. } => {
-                        let scan = self.scans.get(cheat_id).ok_or_else(|| {
-                            EngineError::InvalidRequest(format!("no scan state for '{cheat_id}'"))
-                        })?;
-                        scan.resolved_address.ok_or_else(|| {
-                            EngineError::InvalidRequest(
-                                "address not resolved yet — scan first".into(),
-                            )
-                        })?
-                    }
-                    _ => resolver::resolve(&resolver, mem, maps, &self.scripts)?,
-                };
+                let addr = resolver::resolve(&resolver, mem, maps, &self.scripts)?;
                 crate::cheats::value::write_value(mem, addr, value_type, value)?;
                 Ok(value.clone())
             }
@@ -400,29 +364,6 @@ impl TrainerRuntime {
             CheatAction::AutoAssembler { .. } => Err(EngineError::InvalidRequest(
                 "auto_assembler cheats are toggles; they don't take values".into(),
             )),
-        }
-    }
-
-    /// Resolve the target address for a one-shot write, handling the `scan`
-    /// resolver (which must be resolved via prior scan commands, like
-    /// `set_value` does for value cheats).
-    fn resolve_action_addr(
-        &self,
-        resolver: &resolver::Resolver,
-        cheat_id: &str,
-        mem: &MemoryAccess,
-        maps: &[MemoryRegion],
-    ) -> EngineResult<usize> {
-        match resolver {
-            resolver::Resolver::Scan { .. } => {
-                let scan = self.scans.get(cheat_id).ok_or_else(|| {
-                    EngineError::InvalidRequest(format!("no scan state for '{cheat_id}'"))
-                })?;
-                scan.resolved_address.ok_or_else(|| {
-                    EngineError::InvalidRequest("address not resolved yet — scan first".into())
-                })
-            }
-            _ => resolver::resolve(resolver, mem, maps, &self.scripts),
         }
     }
 
@@ -457,7 +398,7 @@ impl TrainerRuntime {
                 ..
             } => {
                 self.ensure_dependencies_now(cheat_id, mem, maps)?;
-                let addr = self.resolve_action_addr(&resolver, cheat_id, mem, maps)?;
+                let addr = resolver::resolve(&resolver, mem, maps, &self.scripts)?;
                 let v = serde_json::Value::from(value);
                 crate::cheats::value::write_value(mem, addr, value_type, &v)?;
                 Ok(v)
@@ -474,7 +415,7 @@ impl TrainerRuntime {
                     )
                 })?;
                 self.ensure_dependencies_now(cheat_id, mem, maps)?;
-                let addr = self.resolve_action_addr(&resolver, cheat_id, mem, maps)?;
+                let addr = resolver::resolve(&resolver, mem, maps, &self.scripts)?;
                 crate::cheats::value::write_value(mem, addr, value_type, &v)?;
                 Ok(v)
             }
@@ -486,103 +427,6 @@ impl TrainerRuntime {
                     .into(),
             )),
         }
-    }
-
-    /// Start a value scan for a scan-resolver cheat.
-    pub fn scan_resolve_start(
-        &mut self,
-        cheat_id: &str,
-        value: &Value,
-        mem: &MemoryAccess,
-        maps: &[MemoryRegion],
-    ) -> EngineResult<usize> {
-        let i = self.index_of(cheat_id)?;
-        let action = self.def.cheats[i].action.clone();
-        match action {
-            CheatAction::Value { value_type, .. } => {
-                let fval = value.as_f64().ok_or_else(|| {
-                    EngineError::InvalidRequest("expected number for scan".into())
-                })?;
-                let width = value_type.size();
-                let is_float = matches!(
-                    value_type,
-                    crate::trainer::definition::ValueType::Float32
-                        | crate::trainer::definition::ValueType::Float64
-                );
-                let results = scanner::first_scan(mem, maps, fval, width, is_float)?;
-                let scan = self.scans.get_mut(cheat_id).ok_or_else(|| {
-                    EngineError::InvalidRequest(format!("'{cheat_id}' is not a scan cheat"))
-                })?;
-                scan.results = results;
-                scan.width = width;
-                scan.is_float = is_float;
-                scan.resolved_address = None;
-                Ok(scan.results.len())
-            }
-            _ => Err(EngineError::InvalidRequest(
-                "scan_resolve only works for value cheats with scan resolver".into(),
-            )),
-        }
-    }
-
-    /// Filter scan results to a new value.
-    pub fn scan_resolve_filter(
-        &mut self,
-        cheat_id: &str,
-        value: &Value,
-        mem: &MemoryAccess,
-    ) -> EngineResult<usize> {
-        let scan = self.scans.get_mut(cheat_id).ok_or_else(|| {
-            EngineError::InvalidRequest(format!("'{cheat_id}' has no scan state"))
-        })?;
-        if scan.results.is_empty() {
-            return Err(EngineError::InvalidRequest(
-                "no previous scan — call scan_resolve_start first".into(),
-            ));
-        }
-        let fval = value
-            .as_f64()
-            .ok_or_else(|| EngineError::InvalidRequest("expected number for filter".into()))?;
-        let results = scanner::next_scan(mem, &scan.results, fval, scan.width, scan.is_float)?;
-        scan.results = results;
-        Ok(scan.results.len())
-    }
-
-    /// Get scan result count.
-    pub fn scan_resolve_count(&self, cheat_id: &str) -> EngineResult<(usize, bool)> {
-        let scan = self.scans.get(cheat_id).ok_or_else(|| {
-            EngineError::InvalidRequest(format!("'{cheat_id}' has no scan state"))
-        })?;
-        Ok((scan.results.len(), scan.resolved_address.is_some()))
-    }
-
-    /// Finalize scan: pick the first result as the resolved address.
-    pub fn scan_resolve_done(
-        &mut self,
-        cheat_id: &str,
-        mem: &MemoryAccess,
-    ) -> EngineResult<(usize, Option<f64>)> {
-        let scan = self.scans.get_mut(cheat_id).ok_or_else(|| {
-            EngineError::InvalidRequest(format!("'{cheat_id}' has no scan state"))
-        })?;
-        if scan.results.is_empty() {
-            return Err(EngineError::InvalidRequest(
-                "no scan results to resolve".into(),
-            ));
-        }
-        let addr = scan.results[0];
-        scan.resolved_address = Some(addr);
-
-        // Read current value
-        let current = if scan.is_float && scan.width == 8 {
-            match mem.read_bytes(addr, 8) {
-                Ok(bytes) => Some(f64::from_ne_bytes(bytes[..8].try_into().unwrap())),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        Ok((addr, current))
     }
 
     fn record<T>(&mut self, cheat_id: &str, result: &EngineResult<T>) {
@@ -601,10 +445,6 @@ impl TrainerRuntime {
     pub fn reset_runtime_state(&mut self) {
         for rt in self.patches.values_mut() {
             rt.reset();
-        }
-        for scan in self.scans.values_mut() {
-            scan.results.clear();
-            scan.resolved_address = None;
         }
         self.scripts.lock().unwrap().reset();
         self.freezes.clear();

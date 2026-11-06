@@ -34,10 +34,6 @@ const rpc = {
   >("set_value"),
   triggerCheat: callable<[cheatId: string], EngineEnvelope<TriggerResult>>("trigger_cheat"),
   reloadTrainer: callable<[], EngineEnvelope<{ reloaded: boolean }>>("reload_trainer"),
-  scanResolveStart: callable<[cheatId: string, value: number], EngineEnvelope<{ count: number; resolved: boolean }>>("scan_resolve_start"),
-  scanResolveFilter: callable<[cheatId: string, value: number], EngineEnvelope<{ count: number; resolved: boolean }>>("scan_resolve_filter"),
-  scanResolveCount: callable<[cheatId: string], EngineEnvelope<{ count: number; resolved: boolean }>>("scan_resolve_count"),
-  scanResolveDone: callable<[cheatId: string], EngineEnvelope<{ address: number; current_value: number | null }>>("scan_resolve_done"),
   // Trainer store
   repoList: callable<[], EngineEnvelope<{ trainers: StoreTrainer[] }>>("repo_list"),
   repoInstall: callable<[appId: number], EngineEnvelope<{ jobId: string }>>("repo_install"),
@@ -80,14 +76,6 @@ export const backend = {
   triggerCheat: (cheatId: string): Promise<TriggerResult> =>
     rpc.triggerCheat(cheatId).then(unwrap),
   reloadTrainer: (): Promise<{ reloaded: boolean }> => rpc.reloadTrainer().then(unwrap),
-  scanResolveStart: (cheatId: string, value: number) =>
-    rpc.scanResolveStart(cheatId, value).then(unwrap),
-  scanResolveFilter: (cheatId: string, value: number) =>
-    rpc.scanResolveFilter(cheatId, value).then(unwrap),
-  scanResolveCount: (cheatId: string) =>
-    rpc.scanResolveCount(cheatId).then(unwrap),
-  scanResolveDone: (cheatId: string) =>
-    rpc.scanResolveDone(cheatId).then(unwrap),
   // Trainer store
   repoList: (): Promise<StoreTrainer[]> =>
     rpc.repoList().then(unwrap).then((d) => d.trainers),

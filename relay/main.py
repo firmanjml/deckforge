@@ -91,18 +91,6 @@ class Plugin:
     async def reload_trainer(self) -> dict:
         return await self.engine.request("reload_trainer")
 
-    async def scan_resolve_start(self, cheat_id: str, value) -> dict:
-        return await self.engine.request("scan_resolve_start", cheatId=cheat_id, value=value)
-
-    async def scan_resolve_filter(self, cheat_id: str, value) -> dict:
-        return await self.engine.request("scan_resolve_filter", cheatId=cheat_id, value=value)
-
-    async def scan_resolve_count(self, cheat_id: str) -> dict:
-        return await self.engine.request("scan_resolve_count", cheatId=cheat_id)
-
-    async def scan_resolve_done(self, cheat_id: str) -> dict:
-        return await self.engine.request("scan_resolve_done", cheatId=cheat_id)
-
     # --- Trainer store (browse / install / uninstall) ----------------------
 
     async def repo_list(self) -> dict:

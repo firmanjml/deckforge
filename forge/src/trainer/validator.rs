@@ -180,6 +180,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rejects_scan_resolver() {
+        let json = r#"{
+          "formatVersion": 1,
+          "game": { "steamAppId": 1, "name": "G", "process": "g.exe" },
+          "trainer": { "id": "t", "name": "T", "version": "1" },
+          "cheats": [{
+            "id": "money", "name": "Money", "control": "number",
+            "action": { "type": "value", "valueType": "int32",
+              "resolver": { "type": "scan", "valueType": "int32" } }
+          }]
+        }"#;
+        assert!(serde_json::from_str::<TrainerDefinition>(json).is_err());
+    }
+
     fn lua_trainer_json(script: &str) -> String {
         format!(
             r#"{{
