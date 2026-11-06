@@ -41,6 +41,8 @@ const SCAN_CHUNK: usize = 4 * 1024 * 1024;
 const MAX_SCAN_RESULTS: usize = 4096;
 /// Cap for disasm_targets window.
 const MAX_DISASM_BYTES: usize = 0x4000;
+/// Resolves at least this slow are logged, to make slow discovery visible.
+const SLOW_RESOLVE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Shared handle to a trainer's script engine (main thread + freeze manager).
 pub type ScriptEngineHandle = Arc<Mutex<ScriptEngine>>;
@@ -75,7 +77,10 @@ struct Vm {
 struct Ctx {
     pid: i32,
     module: String,
-    maps: Vec<MemoryRegion>,
+    /// Shared so that a Lua API call does not copy the whole memory map.
+    maps: Arc<Vec<MemoryRegion>>,
+    /// Pointer size of the attached process, read once from its PE header.
+    pointer_size: Option<usize>,
     session: Arc<Mutex<crate::trainer::session::TrainerSession>>,
 }
 
@@ -114,15 +119,19 @@ impl ScriptEngine {
         let vm = self.vm.as_mut().unwrap();
         {
             let mut ctx = vm.ctx.lock().unwrap();
+            if ctx.pid != mem.pid {
+                ctx.pointer_size = None;
+            }
             ctx.pid = mem.pid;
-            ctx.maps = maps.to_vec();
+            ctx.maps = Arc::new(maps.to_vec());
         }
-        let v: Value = vm
-            .lua
-            .load(code)
-            .set_name("resolver")
-            .eval()
-            .map_err(|e| EngineError::ScriptError(format!("{e}")))?;
+        let started = std::time::Instant::now();
+        let result = vm.lua.load(code).set_name("resolver").eval::<Value>();
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_RESOLVE {
+            eprintln!("[forge] script resolve took {} ms", elapsed.as_millis());
+        }
+        let v = result.map_err(|e| EngineError::ScriptError(format!("{e}")))?;
         match v {
             Value::Integer(i) if i >= 0 => Ok(i as usize),
             other => Err(EngineError::ScriptError(format!(
@@ -139,7 +148,8 @@ impl ScriptEngine {
         let ctx: SharedCtx = Arc::new(Mutex::new(Ctx {
             pid: 0,
             module: self.module.clone(),
-            maps: Vec::new(),
+            maps: Arc::new(Vec::new()),
+            pointer_size: None,
             session: Arc::clone(&self.session),
         }));
         let lua = create_sandboxed_lua()
@@ -211,10 +221,15 @@ fn lua_err(e: EngineError) -> mlua::Error {
     mlua::Error::external(e)
 }
 
-/// `(mem, maps, module)` snapshot from the shared context.
-fn snapshot(ctx: &SharedCtx) -> mlua::Result<(MemoryAccess, Vec<MemoryRegion>, String)> {
+/// Memory accessor for the attached process.
+fn memory(ctx: &SharedCtx) -> MemoryAccess {
+    MemoryAccess::new(ctx.lock().unwrap().pid)
+}
+
+/// `(mem, maps)` snapshot from the shared context.
+fn snapshot(ctx: &SharedCtx) -> (MemoryAccess, Arc<Vec<MemoryRegion>>) {
     let g = ctx.lock().unwrap();
-    Ok((MemoryAccess::new(g.pid), g.maps.clone(), g.module.clone()))
+    (MemoryAccess::new(g.pid), Arc::clone(&g.maps))
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +243,7 @@ macro_rules! reg_value_api {
             $rname,
             $lua.create_function(move |_, addr: i64| {
                 let addr = to_addr(addr)?;
-                let (mem, _, _) = snapshot(&c)?;
+                let mem = memory(&c);
                 mem.$rmethod(addr).map_err(lua_err)
             })?,
         )?;
@@ -237,7 +252,7 @@ macro_rules! reg_value_api {
             $wname,
             $lua.create_function(move |_, (addr, v): (i64, $ty)| {
                 let addr = to_addr(addr)?;
-                let (mem, _, _) = snapshot(&c)?;
+                let mem = memory(&c);
                 mem.$wmethod(addr, v).map_err(lua_err)
             })?,
         )?;
@@ -269,7 +284,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             "read_bytes",
             lua.create_function(move |lua, (addr, len): (i64, usize)| {
                 let addr = to_addr(addr)?;
-                let (mem, _, _) = snapshot(&c)?;
+                let mem = memory(&c);
                 let bytes = mem.read_bytes(addr, len).map_err(lua_err)?;
                 lua.create_sequence_from(bytes)
             })?,
@@ -283,7 +298,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
                 if len > 64 * 1024 * 1024 {
                     return Err(mlua::Error::external("read_block length capped at 64 MiB"));
                 }
-                let (mem, _, _) = snapshot(&c)?;
+                let mem = memory(&c);
                 let bytes = mem.read_bytes(addr, len).map_err(lua_err)?;
                 Ok(Value::String(lua.create_string(&bytes)?))
             })?,
@@ -294,7 +309,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             lua.create_function(move |_, (addr, bytes): (i64, mlua::Table)| {
                 let addr = to_addr(addr)?;
                 let data: Vec<u8> = bytes.sequence_values::<u8>().collect::<mlua::Result<_>>()?;
-                let (mem, _, _) = snapshot(&c)?;
+                let mem = memory(&c);
                 mem.write_bytes(addr, &data).map_err(lua_err)
             })?,
         )?;
@@ -317,7 +332,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             "read_pointer",
             lua.create_function(move |_, addr: i64| {
                 let addr = to_addr(addr)?;
-                let (mem, _, _) = snapshot(&c)?;
+                let mem = memory(&c);
                 match pointer_size(&c)? {
                     8 => mem.read_u64(addr).map(|v| v as i64).map_err(lua_err),
                     _ => mem.read_u32(addr).map(|v| v as i64).map_err(lua_err),
@@ -334,7 +349,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             lua.create_function(move |lua, (addr, max_len): (i64, Option<usize>)| {
                 let addr = to_addr(addr)?;
                 let max = max_len.unwrap_or(128).min(4096);
-                let (mem, _, _) = snapshot(&c)?;
+                let mem = memory(&c);
                 let bytes = mem.read_bytes(addr, max).map_err(lua_err)?;
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 if end == 0 {
@@ -351,7 +366,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
         t.set(
             "find_module",
             lua.create_function(move |lua, name: String| {
-                let (_, maps, _) = snapshot(&c)?;
+                let (_, maps) = snapshot(&c);
                 match crate::memory::find_module(&maps, &name) {
                     Some(info) => {
                         let out = lua.create_table()?;
@@ -370,7 +385,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             "region_of",
             lua.create_function(move |lua, addr: i64| {
                 let addr = to_addr(addr)?;
-                let (_, maps, _) = snapshot(&c)?;
+                let (_, maps) = snapshot(&c);
                 match maps.iter().find(|m| addr >= m.start && addr < m.end) {
                     Some(m) => {
                         let out = lua.create_table()?;
@@ -392,7 +407,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
         t.set(
             "regions",
             lua.create_function(move |lua, ()| {
-                let (_, maps, _) = snapshot(&c)?;
+                let (_, maps) = snapshot(&c);
                 let out = lua.create_table()?;
                 for (i, m) in maps.iter().enumerate() {
                     let r = lua.create_table()?;
@@ -417,7 +432,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
         t.set(
             "scan_signature",
             lua.create_function(move |_, (module, pattern, offset): (String, String, Option<i64>)| {
-                let (mem, maps, _) = snapshot(&c)?;
+                let (mem, maps) = snapshot(&c);
                 let off = offset.map(to_addr).transpose()?;
                 crate::resolver::signature::resolve(&mem, &maps, &module, &pattern, off)
                     .map(|a| a as i64)
@@ -430,7 +445,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             "scan_signature_all",
             lua.create_function(
                 move |lua, (module, pattern): (String, String)| {
-                    let (mem, maps, _) = snapshot(&c)?;
+                    let (mem, maps) = snapshot(&c);
                     let pat = crate::resolver::signature::parse_pattern(&pattern)
                         .map_err(lua_err)?;
                     // Scan the module's whole PE span (Proton maps most
@@ -438,7 +453,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
                     let (lo, hi) =
                         crate::memory::ops::module_span(&mem, &maps, &module).map_err(lua_err)?;
                     let mut out = Vec::new();
-                    for region in &maps {
+                    for region in maps.iter() {
                         if !region.readable || region.size() > MAX_SCAN_REGION {
                             continue;
                         }
@@ -473,7 +488,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             "resolve_pointer",
             lua.create_function(
                 move |_, (module, offset, offsets): (String, i64, Option<Vec<i64>>)| {
-                    let (mem, maps, _) = snapshot(&c)?;
+                    let (mem, maps) = snapshot(&c);
                     let to_hex = |v: i64| -> mlua::Result<crate::resolver::HexValue> {
                         let v = u64::try_from(v).map_err(|_| {
                             mlua::Error::external(format!("invalid offset {v}"))
@@ -503,7 +518,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
         t.set(
             "scan_string",
             lua.create_function(move |lua, (needle, module): (String, Option<String>)| {
-                let (mem, maps, _) = snapshot(&c)?;
+                let (mem, maps) = snapshot(&c);
                 let hits = scan_for_bytes(
                     &mem,
                     &maps,
@@ -526,7 +541,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             lua.create_function(
                 move |lua, (addr, module, writable): (i64, Option<String>, Option<bool>)| {
                     let addr = to_addr(addr)?;
-                    let (mem, maps, _) = snapshot(&c)?;
+                    let (mem, maps) = snapshot(&c);
                     let ps = pointer_size(&c)?;
                     let needle = if ps == 8 {
                         (addr as u64).to_ne_bytes().to_vec()
@@ -558,7 +573,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             lua.create_function(move |lua, (addr, size): (i64, Option<usize>)| {
                 let addr = to_addr(addr)?;
                 let size = size.unwrap_or(0x200).min(MAX_DISASM_BYTES);
-                let (mem, _, _) = snapshot(&c)?;
+                let mem = memory(&c);
                 let bitness = if pointer_size(&c)? == 8 { 64 } else { 32 };
                 let bytes = mem.read_bytes(addr, size).map_err(lua_err)?;
                 let d = crate::memory::disasm::IcedDisassembler::new(bitness);
@@ -582,7 +597,7 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
             "rtti_class_name",
             lua.create_function(move |lua, addr: i64| {
                 let addr = to_addr(addr)?;
-                let (mem, maps, _) = snapshot(&c)?;
+                let (mem, maps) = snapshot(&c);
                 let is64 = pointer_size(&c)? == 8;
                 match rtti_class_name(&mem, &maps, addr, is64) {
                     Some(name) => Ok(Value::String(lua.create_string(&name)?)),
@@ -651,19 +666,27 @@ fn register_trainer_api(lua: &Lua, ctx: SharedCtx) -> mlua::Result<()> {
 /// Pointer size of the target, from the PE machine type of the game module
 /// (0x8664 = x64 → 8, 0x14C = x86 → 4). Falls back to 8 when undetectable.
 fn pointer_size(ctx: &SharedCtx) -> mlua::Result<usize> {
-    let (mem, maps, module) = snapshot(ctx)?;
+    let (mem, maps, module) = {
+        let g = ctx.lock().unwrap();
+        if let Some(size) = g.pointer_size {
+            return Ok(size);
+        }
+        (MemoryAccess::new(g.pid), Arc::clone(&g.maps), g.module.clone())
+    };
     let base = crate::memory::module_base(&maps, &module)
         .ok_or_else(|| lua_err(EngineError::ModuleNotFound(module.clone())))?;
     let mz = mem.read_bytes(base, 2).map_err(lua_err)?;
-    if mz != [0x4D, 0x5A] {
-        return Ok(8); // not a PE (native ELF?): assume 64-bit
-    }
-    let e_lfanew = mem.read_u32(base + 0x3C).map_err(lua_err)? as usize;
-    let machine = mem.read_u16(base + e_lfanew + 4).map_err(lua_err)?;
-    Ok(match machine {
-        0x14C => 4,
-        _ => 8,
-    })
+    let size = if mz == [0x4D, 0x5A] {
+        let e_lfanew = mem.read_u32(base + 0x3C).map_err(lua_err)? as usize;
+        match mem.read_u16(base + e_lfanew + 4).map_err(lua_err)? {
+            0x14C => 4,
+            _ => 8,
+        }
+    } else {
+        8 // not a PE (native ELF?): assume 64-bit
+    };
+    ctx.lock().unwrap().pointer_size = Some(size);
+    Ok(size)
 }
 
 /// Scan regions for `needle`, returning up to [`MAX_SCAN_RESULTS`] hit
