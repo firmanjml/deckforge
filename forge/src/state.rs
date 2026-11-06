@@ -8,7 +8,7 @@ use crate::protocol::{CheatData, GameData, GameInfoData, StatusData, TrainerData
 use crate::store::Store;
 use crate::trainer::{self, TrainerRuntime};
 
-pub const ENGINE_VERSION: &str = "0.1.0";
+pub const ENGINE_VERSION: &str = "0.1.1";
 
 pub struct EngineState {
     pub process: Option<GameProcess>,

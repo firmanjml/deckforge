@@ -1,6 +1,6 @@
 {
   "name": "deckforge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeckForge — a native Decky Loader trainer platform (cockpit + relay + forge).",
   "type": "module",
   "scripts": {
