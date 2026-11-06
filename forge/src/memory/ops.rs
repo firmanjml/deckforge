@@ -15,8 +15,12 @@ use crate::resolver::signature::{all_matches, PatternByte};
 /// Cap on scan results returned by one AOB scan (safety valve; CE's aobscan
 /// expects a unique match, and the AA layer enforces that on top).
 pub const MAX_AOB_RESULTS: usize = 4096;
-/// Largest single region an AOB scan will read.
-const MAX_SCAN_REGION: usize = 512 * 1024 * 1024;
+/// Largest single region an AOB scan will read. Regions are read in chunks, so
+/// this does not guard our memory. A larger region cannot be fully backed on a
+/// 16 GiB Deck, so it is mostly untouched reservation, and reading that costs
+/// seconds of engine time and grows the target's page tables (measured on a
+/// desktop: 5 GiB/s and 2 MiB of page tables per GiB).
+const MAX_SCAN_REGION: usize = 16 * 1024 * 1024 * 1024;
 /// Scan chunk size.
 pub(crate) const SCAN_CHUNK: usize = 4 * 1024 * 1024;
 
@@ -151,6 +155,23 @@ pub(crate) fn loaded_modules(mem: &MemoryAccess, maps: &[MemoryRegion]) -> Vec<M
     modules
 }
 
+/// `region` clipped to `[lo, hi)`, or `None` when nothing is left to scan or the
+/// result is over [`MAX_SCAN_REGION`], which is logged.
+fn scan_bounds(region: &MemoryRegion, lo: usize, hi: usize) -> Option<(usize, usize)> {
+    let (start, end) = (region.start.max(lo), region.end.min(hi));
+    if start >= end {
+        return None;
+    }
+    if end - start > MAX_SCAN_REGION {
+        eprintln!(
+            "[aob_scan] skipping region 0x{start:X}..0x{end:X}: {} bytes is over the {MAX_SCAN_REGION} byte limit",
+            end - start
+        );
+        return None;
+    }
+    Some((start, end))
+}
+
 /// Append to `hits` every occurrence of `needle` in `[start, end)` at an address
 /// that is a multiple of `align`, stopping once `hits` holds `max` addresses.
 /// Overlapping occurrences all count; chunks that cannot be read are skipped.
@@ -216,11 +237,9 @@ impl<'a> MemoryOps for LiveMemory<'a> {
                 continue;
             }
             // Clip the region to the requested span.
-            let start = region.start.max(lo);
-            let end = region.end.min(hi);
-            if start >= end || end - start > MAX_SCAN_REGION {
+            let Some((start, end)) = scan_bounds(region, lo, hi) else {
                 continue;
-            }
+            };
             let size = end - start;
             regions_scanned += 1;
             let mut offset = 0usize;
@@ -284,11 +303,9 @@ impl<'a> MemoryOps for LiveMemory<'a> {
             if !region.readable {
                 continue;
             }
-            let clipped_start = region.start.max(start);
-            let clipped_end = region.end.min(stop);
-            if clipped_start >= clipped_end || clipped_end - clipped_start > MAX_SCAN_REGION {
+            let Some((clipped_start, clipped_end)) = scan_bounds(region, start, stop) else {
                 continue;
-            }
+            };
             let size = clipped_end - clipped_start;
             let mut offset = 0usize;
             let overlap = pattern.len().saturating_sub(1);
@@ -353,7 +370,7 @@ pub fn pe_bitness(mem: &MemoryAccess, maps: &[MemoryRegion], module: &str) -> u3
 }
 
 #[cfg(test)]
-mod scan_chunks_tests {
+mod scan_tests {
     use super::*;
 
     const START: usize = 0x1000_0000;
@@ -404,6 +421,42 @@ mod scan_chunks_tests {
     fn empty_ranges_read_nothing() {
         assert_eq!(scan_chunks(START, START, 7).count(), 0);
         assert_eq!(scan_chunks(START + 1, START, 7).count(), 0);
+    }
+
+    fn region(start: usize, end: usize) -> MemoryRegion {
+        MemoryRegion {
+            start,
+            end,
+            readable: true,
+            writable: true,
+            executable: false,
+            private: true,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn scan_bounds_clips_to_the_requested_span() {
+        let r = region(START, START + 0x1000);
+        assert_eq!(scan_bounds(&r, 0, usize::MAX), Some((START, START + 0x1000)));
+        assert_eq!(
+            scan_bounds(&r, START + 0x10, START + 0x20),
+            Some((START + 0x10, START + 0x20))
+        );
+        assert_eq!(scan_bounds(&r, START + 0x1000, usize::MAX), None);
+    }
+
+    #[test]
+    fn scan_bounds_limits_the_clipped_size_not_the_region_size() {
+        let at_limit = region(START, START + MAX_SCAN_REGION);
+        assert!(scan_bounds(&at_limit, 0, usize::MAX).is_some());
+
+        let over = region(START, START + MAX_SCAN_REGION + 1);
+        assert_eq!(scan_bounds(&over, 0, usize::MAX), None);
+        assert_eq!(
+            scan_bounds(&over, START, START + 0x1000),
+            Some((START, START + 0x1000))
+        );
     }
 }
 
@@ -574,5 +627,103 @@ pub mod mock {
         fn bitness(&self) -> u32 {
             self.bitness
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod live_tests {
+    use super::*;
+    use crate::resolver::signature::parse_pattern;
+
+    const SIZE: usize = 1024 * 1024 * 1024;
+    /// Past the 512 MiB where these regions used to be skipped.
+    const PLANTED: usize = 700 * 1024 * 1024;
+    const NEEDLE: [u8; 4] = [0xDE, 0xC0, 0xAD, 0x0B];
+
+    /// A real 1 GiB mapping in this process that costs almost no memory: it is
+    /// inaccessible apart from a window of chunks around `PLANTED`, so the other
+    /// reads fail quickly and only the planted page is touched. A read that
+    /// starts in the inaccessible part fails whole, so the window starts a chunk
+    /// before the one holding `PLANTED`, whose overlap reaches back into it.
+    struct SparseRegion {
+        base: *mut libc::c_void,
+    }
+
+    impl SparseRegion {
+        fn new() -> Self {
+            // SAFETY: an anonymous mapping at an address the kernel picks, used
+            // only through `base` and unmapped on drop. The window is inside it.
+            let base = unsafe {
+                let base = libc::mmap(
+                    std::ptr::null_mut(),
+                    SIZE,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                );
+                assert_ne!(base, libc::MAP_FAILED);
+                let window = base.cast::<u8>().add((PLANTED / SCAN_CHUNK - 1) * SCAN_CHUNK);
+                let prot = libc::PROT_READ | libc::PROT_WRITE;
+                assert_eq!(libc::mprotect(window.cast(), 3 * SCAN_CHUNK, prot), 0);
+                std::ptr::copy_nonoverlapping(
+                    NEEDLE.as_ptr(),
+                    base.cast::<u8>().add(PLANTED),
+                    NEEDLE.len(),
+                );
+                base
+            };
+            Self { base }
+        }
+
+        fn start(&self) -> usize {
+            self.base as usize
+        }
+
+        fn maps(&self) -> Vec<MemoryRegion> {
+            vec![MemoryRegion {
+                start: self.start(),
+                end: self.start() + SIZE,
+                readable: true,
+                writable: true,
+                executable: false,
+                private: true,
+                path: None,
+            }]
+        }
+    }
+
+    impl Drop for SparseRegion {
+        fn drop(&mut self) {
+            // SAFETY: `base` is the start of a live mapping of `SIZE` bytes.
+            unsafe { libc::munmap(self.base, SIZE) };
+        }
+    }
+
+    #[test]
+    fn aob_scan_finds_a_match_in_a_region_over_512_mib() {
+        let region = SparseRegion::new();
+        let mem = MemoryAccess::new(std::process::id() as i32);
+        let maps = region.maps();
+        let live = LiveMemory::new(&mem, &maps, "game.exe");
+        let pattern = parse_pattern("DE C0 AD 0B").unwrap();
+        assert_eq!(
+            live.aob_scan(None, &pattern).unwrap(),
+            [region.start() + PLANTED]
+        );
+    }
+
+    #[test]
+    fn aob_scan_range_finds_a_match_in_a_range_over_512_mib() {
+        let region = SparseRegion::new();
+        let mem = MemoryAccess::new(std::process::id() as i32);
+        let maps = region.maps();
+        let live = LiveMemory::new(&mem, &maps, "game.exe");
+        let pattern = parse_pattern("DE C0 AD 0B").unwrap();
+        let (start, stop) = (region.start(), region.start() + SIZE);
+        assert_eq!(
+            live.aob_scan_range(start, stop, &pattern).unwrap(),
+            [start + PLANTED]
+        );
     }
 }
