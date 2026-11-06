@@ -18,7 +18,7 @@ pub const MAX_AOB_RESULTS: usize = 4096;
 /// Largest single region an AOB scan will read.
 const MAX_SCAN_REGION: usize = 512 * 1024 * 1024;
 /// Scan chunk size.
-const SCAN_CHUNK: usize = 4 * 1024 * 1024;
+pub(crate) const SCAN_CHUNK: usize = 4 * 1024 * 1024;
 
 /// The generic memory operations the Auto Assembler engine needs. Deliberately
 /// small: read/write, AOB scan, module lookup, alloc/dealloc, bitness.
@@ -97,25 +97,32 @@ pub(crate) fn module_span(
     maps: &[MemoryRegion],
     module: &str,
 ) -> EngineResult<(usize, usize)> {
-    let base =
-        module_base(maps, module).ok_or_else(|| EngineError::ModuleNotFound(module.to_string()))?;
-    let end = read_size_of_image(mem, base)
-        .map(|s| base.saturating_add(s))
-        .unwrap_or_else(|| {
-            maps.iter()
-                .filter(|m| {
-                    m.path.as_deref().is_some_and(|p| {
-                        p.rsplit('/')
-                            .next()
-                            .unwrap_or(p)
-                            .eq_ignore_ascii_case(module)
-                    })
-                })
-                .map(|m| m.end)
-                .max()
-                .unwrap_or(base.saturating_add(64 * 1024 * 1024))
-        });
-    Ok((base, end))
+    let info =
+        find_module(maps, module).ok_or_else(|| EngineError::ModuleNotFound(module.to_string()))?;
+    let end = read_size_of_image(mem, info.base)
+        .map(|s| info.base.saturating_add(s))
+        .unwrap_or(info.end);
+    Ok((info.base, end))
+}
+
+/// The `(addr, len)` reads that cover `[start, end)` one [`SCAN_CHUNK`] at a
+/// time. Each read after the first starts `overlap` bytes early, so with an
+/// `overlap` of the pattern length minus one, every match appears in exactly
+/// one read: the one covering its last byte. Yields nothing for an empty range.
+pub(crate) fn scan_chunks(
+    start: usize,
+    end: usize,
+    overlap: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    let mut next = start;
+    std::iter::from_fn(move || {
+        if next >= end {
+            return None;
+        }
+        let addr = next - overlap.min(next - start);
+        next = end.min(next.saturating_add(SCAN_CHUNK));
+        Some((addr, next - addr))
+    })
 }
 
 /// Every file-backed module mapped into the process, with `end` taken from
@@ -312,6 +319,61 @@ pub fn pe_bitness(mem: &MemoryAccess, maps: &[MemoryRegion], module: &str) -> u3
     match mem.read_u16(base + e_lfanew as usize + 4) {
         Ok(0x14C) => 32,
         _ => 64,
+    }
+}
+
+#[cfg(test)]
+mod scan_chunks_tests {
+    use super::*;
+
+    const START: usize = 0x1000_0000;
+
+    /// The reads that fully contain a match at `[pos, pos + len)`.
+    fn reads_containing(reads: &[(usize, usize)], pos: usize, len: usize) -> usize {
+        reads
+            .iter()
+            .filter(|(addr, size)| *addr <= pos && pos + len <= addr + size)
+            .count()
+    }
+
+    #[test]
+    fn every_match_is_in_exactly_one_read() {
+        let end = START + 3 * SCAN_CHUNK + 123;
+        for len in [1, 2, 8, 4096, SCAN_CHUNK, SCAN_CHUNK + 1, 2 * SCAN_CHUNK + 7] {
+            let reads: Vec<_> = scan_chunks(START, end, len - 1).collect();
+            let mut positions = vec![START, end - len];
+            for boundary in 1..=3 {
+                let boundary = START + boundary * SCAN_CHUNK;
+                positions.extend((0..=len.min(16)).map(|back| boundary - back));
+                positions.push(boundary - len);
+                positions.push(boundary);
+            }
+            for pos in positions {
+                if pos >= START && pos + len <= end {
+                    assert_eq!(reads_containing(&reads, pos, len), 1, "len {len} at 0x{pos:x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reads_stay_in_range_and_cover_it() {
+        let end = START + 2 * SCAN_CHUNK + 1;
+        let reads: Vec<_> = scan_chunks(START, end, 7).collect();
+        assert_eq!(
+            reads,
+            [
+                (START, SCAN_CHUNK),
+                (START + SCAN_CHUNK - 7, SCAN_CHUNK + 7),
+                (START + 2 * SCAN_CHUNK - 7, 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_ranges_read_nothing() {
+        assert_eq!(scan_chunks(START, START, 7).count(), 0);
+        assert_eq!(scan_chunks(START + 1, START, 7).count(), 0);
     }
 }
 
